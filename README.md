@@ -33,7 +33,7 @@ throughout — both read the same rows, and either side can serve at any point
 cd saleor-core && cp .env.example .env && uv run poe migrate && uv run poe populatedb
 
 # 2. The Rust engine against it — no dump, no ETL, no downtime window:
-export RUSTIFY_DATABASE_URL="postgres://saleor:saleor@localhost:5432/saleor"
+export RUSTIFY_DATABASE_URL="postgres://saleor:saleor@localhost:5434/saleor"
 export RSA_PRIVATE_KEY="$(cat crates/db/tests/testdata/test_rsa.pem)"  # dev only
 ./target/debug/saleor-rustify
 # gRPC :50051 · GraphQL http://127.0.0.1:8000/graphql · metrics :9000
@@ -47,7 +47,7 @@ Or via Docker (images published per push to `master`):
 
 ```bash
 docker run --rm -p 50051:50051 -p 8000:8000 \
-  -e RUSTIFY_DATABASE_URL="postgres://saleor:saleor@host.docker.internal:5432/saleor" \
+  -e RUSTIFY_DATABASE_URL="postgres://saleor:saleor@host.docker.internal:5434/saleor" \
   ghcr.io/matinsanei/saleor-rustify:latest
 # Modes: ...:latest worker|beat|check|migrate  (celery-worker / beat equivalents)
 ```

@@ -10,3 +10,5 @@ sdk/ts/dist/
 __pycache__/
 *.pyc
 /target/
+# Local test-artifact media (export tests write here via relative paths).
+crates/saleor/
