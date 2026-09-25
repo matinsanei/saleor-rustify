@@ -139,8 +139,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         async fn handler(
             Extension(schema): Extension<saleor_rustify_graphql::AppSchema>,
             headers: axum::http::HeaderMap,
-            Json(mut req): Json<async_graphql::Request>,
+            // Raw body + async-graphql's own body parser: plain JSON behaves
+            // exactly as before, and `multipart/form-data` (uploads) follows
+            // the graphql-multipart-request-spec. (async-graphql-axum's
+            // extractor can't be used: it targets axum 0.8, we run 0.7.)
+            body: axum::body::Bytes,
         ) -> Json<async_graphql::Response> {
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let reader = async_graphql::futures_util::io::Cursor::new(body);
+            let mut req = match async_graphql::http::receive_body(
+                content_type,
+                reader,
+                Default::default(),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Json(async_graphql::Response::from_errors(vec![
+                        async_graphql::ServerError::new(format!("bad request: {e:?}"), None),
+                    ]))
+                }
+            };
             // Debug log: first 500 chars of query so Dashboard mismatches are visible
             // in backend logs (RUST_LOG=info).
             tracing::info!(query = %req.query.chars().take(500).collect::<String>(), op = ?req.operation_name);

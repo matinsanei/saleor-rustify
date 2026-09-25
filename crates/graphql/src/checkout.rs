@@ -307,6 +307,96 @@ impl CheckoutQuery {
         Ok(Some(to_gql_checkout(&co, &lines, ch)))
     }
 
+    /// Abandoned/active checkout list (Django `checkouts`; staff only).
+    /// Slim select (token + created_at) ordered + paginated in memory, same
+    /// pattern as `orders`/`customers`. Supports `channel` slug, `filter`
+    /// (customer/search/created/updatedAt/channels/authorize/charge statuses)
+    /// and `sortBy` (CREATION_DATE/CUSTOMER; PAYMENT/RANK fall back to
+    /// creation date — no payment-rank column exists upstream either).
+    /// `metadata` sub-filter stays accepted-ignored (no GIN index; documented).
+    async fn checkouts(
+        &self, ctx: &Context<'_>,
+        #[graphql(name = "sortBy")] sort_by: Option<gen::CheckoutSortingInput>,
+        filter: Option<gen::CheckoutFilterInput>,
+        channel: Option<String>,
+        before: Option<String>, after: Option<String>,
+        first: Option<i32>, last: Option<i32>,
+    ) -> Result<gen::CheckoutCountableConnection> {
+        crate::account::require_any_perm(ctx, &["manage_orders", "manage_checkouts"]).await?;
+        let _ = (before, last);
+        let g = ctx.data::<GqlContext>()?; let db = g.db()?;
+        let off = after.and_then(|c| crate::common::decode_cursor(&c)).unwrap_or(0);
+        let lim = first.unwrap_or(20).clamp(1, 100) as usize;
+        let empty = || gen::CheckoutCountableConnection {
+            edges: vec![],
+            page_info: Some(crate::common::PageInfo { has_next_page: false, has_previous_page: false, start_cursor: None, end_cursor: None }),
+        };
+        use saleor_rustify_db::entities::checkout_checkout::{Column as CCol, Entity as CEnt};
+        use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+        let mut cond = Condition::all();
+        if let Some(slug) = channel.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            use saleor_rustify_db::entities::channel_channel::{Column as ChCol, Entity as ChEnt};
+            let cid: Option<i32> = ChEnt::find().select_only().column(ChCol::Id)
+                .filter(ChCol::Slug.eq(slug))
+                .into_tuple::<i32>().one(db).await.map_err(|e| Error::new(e.to_string()))?;
+            match cid {
+                Some(id) => { cond = cond.add(CCol::ChannelId.eq(id)); }
+                None => return Ok(empty()),
+            }
+        }
+        if let Some(f) = filter.as_ref() {
+            if let Some(c) = f.customer.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                cond = cond.add(CCol::Email.like(format!("%{c}%")));
+            }
+            if let Some(s) = f.search.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let mut any = Condition::any().add(CCol::Email.like(format!("%{s}%")));
+                if let Ok(u) = s.parse::<Uuid>() {
+                    any = any.add(CCol::Token.eq(u));
+                }
+                cond = cond.add(any);
+            }
+            if let Some(r) = f.created.as_ref() {
+                if let Some(gte) = r.gte { cond = cond.add(CCol::CreatedAt.gte(gte)); }
+                if let Some(lte) = r.lte { cond = cond.add(CCol::CreatedAt.lte(lte)); }
+            }
+            if let Some(r) = f.updated_at.as_ref() {
+                if let Some(gte) = r.gte { cond = cond.add(CCol::LastChange.gte(gte)); }
+                if let Some(lte) = r.lte { cond = cond.add(CCol::LastChange.lte(lte)); }
+            }
+            let ch_ids: Vec<i32> = f.channels.clone().unwrap_or_default().into_iter()
+                .filter_map(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).collect();
+            if !ch_ids.is_empty() { cond = cond.add(CCol::ChannelId.is_in(ch_ids)); }
+            let auth: Vec<String> = f.authorize_status.clone().unwrap_or_default().into_iter()
+                .map(|s| format!("{s:?}").to_lowercase()).collect();
+            if !auth.is_empty() { cond = cond.add(CCol::AuthorizeStatus.is_in(auth)); }
+            let chg: Vec<String> = f.charge_status.clone().unwrap_or_default().into_iter()
+                .map(|s| format!("{s:?}").to_lowercase()).collect();
+            if !chg.is_empty() { cond = cond.add(CCol::ChargeStatus.is_in(chg)); }
+        }
+        let asc = sort_by.as_ref().map(|s| matches!(s.direction, gen::OrderDirection::ASC)).unwrap_or(false);
+        let mut q = CEnt::find().select_only().column(CCol::Token).column(CCol::CreatedAt).filter(cond);
+        q = match sort_by.as_ref().map(|s| &s.field) {
+            Some(gen::CheckoutSortField::CUSTOMER) => if asc { q.order_by_asc(CCol::Email) } else { q.order_by_desc(CCol::Email) },
+            _ => if asc { q.order_by_asc(CCol::CreatedAt) } else { q.order_by_desc(CCol::CreatedAt) },
+        };
+        let rows: Vec<(Uuid, chrono::DateTime<chrono::FixedOffset>)> =
+            q.into_tuple().all(db).await.map_err(|e| Error::new(e.to_string()))?;
+        let total = rows.len();
+        let edges = rows.into_iter().skip(off).take(lim).enumerate().map(|(i, (token, created))| {
+            gen::CheckoutCountableEdge {
+                node: Some(gen::Checkout {
+                    id: Some(ID(crate::common::gid("Checkout", token))),
+                    created: Some(created.with_timezone(&chrono::Utc)),
+                }),
+                cursor: Some(crate::common::encode_cursor(off + i)),
+            }
+        }).collect();
+        Ok(gen::CheckoutCountableConnection {
+            edges,
+            page_info: Some(crate::common::PageInfo { has_next_page: off + lim < total, has_previous_page: off > 0, start_cursor: None, end_cursor: None }),
+        })
+    }
+
     /// Admin checkout-lines view (paginated across checkouts).
     async fn checkout_lines(
         &self, ctx: &Context<'_>,

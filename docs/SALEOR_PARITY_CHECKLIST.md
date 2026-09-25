@@ -1,10 +1,10 @@
-# Saleor parity — master checklist (measured 2026-09-24)
+# Saleor parity — master checklist (measured 2026-09-25)
 
-Schema baseline: `saleor/dashboard/schema-main.graphql` = **90 queries / 339 mutations**.
+Schema baseline: `saleor-dashboard-3.23.33/schema-main.graphql` = **90 queries / 339 mutations**.
 Ours (live SDL): **91 queries / 346 mutations** (extra = legacy aliases like
 `orderAddNote`, old-style `createCheckout`, `_nodeAnchor`).
 Every schema root resolves live — zero "Unknown field/argument" gaps.
-Dashboard ops: **458/458 green**. DB contracts: **171/171 green**.
+Dashboard ops: **458/458 green**. DB contracts: **175/175 green**.
 
 Legend: `[x]` real + tested · `[~]` real but bounded (documented) · `[ ]` missing/stub.
 
@@ -27,11 +27,11 @@ Legend: `[x]` real + tested · `[~]` real but bounded (documented) · `[ ]` miss
 - [x] Drafts: `draftOrderCreate/Update/Delete/Complete/BulkDelete`, `draftOrders` query, `orderLinesCreate` on drafts
 - [x] `orderBulkCreate` (migration import: lines/addresses/discounts/fulfillments/transactions/invoices/notes, ≤50/call)
 - [x] Order view depth: fulfillments, transactions, invoices, addresses, channel, notes, charge/authorize statuses
-- [ ] `checkouts` list query (only dashboard-missing query; needs full `Checkout` node assembly)
+- [x] `checkouts` list query (real rows: channel slug/filter/sort/paginate, staff-gated; dashboard only selects id+created)
 
 ## 4. Gift cards
-- [x] Full CRUD: create (custom codes ≤16)/update/delete/activate/deactivate/notes/resend/settings/bulk/assign, balance adjust, CSV export
-- [ ] `exportGiftCards` filtered scope (ALL/IDS work; FILTER refused honestly), XLSX (CSV only)
+- [x] Full CRUD: create (custom codes ≤16)/update/delete/activate/deactivate/notes/resend/settings/bulk/assign, balance adjust, CSV/XLSX export
+- [x] `exportGiftCards` FILTER scope (list predicates: active/code/currency/created-by/used/products/tags/users/balance ranges; metadata ignored like the list) + XLSX (minimal inline-string workbook, verified zip)
 
 ## 5. Promotions / vouchers / legacy sales
 - [x] Promotions + rules CRUD, bulk delete, channel/gift links, predicate JSON the engine evaluates
@@ -44,7 +44,7 @@ Legend: `[x]` real + tested · `[~]` real but bounded (documented) · `[ ]` miss
 - [x] Product types CRUD + `productType(s)`, `productVariant(s)` queries
 - [x] `attributeBulkCreate/Update`
 - [x] Stock: `stock(s)` reads, `stockBulkUpdate`, zone links, reservations/allocations, sweeper beat
-- [ ] `fileUpload` / `userAvatarUpdate/Delete` (need multipart; Upload scalar stubbed)
+- [x] `fileUpload` (real multipart per graphql-multipart-request-spec: magic-bytes mime check vs Django allowlist + ext match, `file_upload/<name>_<hash><ext>`, served via /media/); `ProductMediaCreate.image` Upload live (stored under `products/`). Category/collection `backgroundImage` Upload inputs typecheck but stay accepted-ignored (reads resolve real paths)
 
 ## 7. Menus / pages
 - [x] Menus/items CRUD + move (MPTT rebuilt), navigation assign, `menu(s)/menuItem(s)` reads
@@ -61,7 +61,7 @@ Legend: `[x]` real + tested · `[~]` real but bounded (documented) · `[ ]` miss
 - [x] `addressValidationRules` (built-in US/CA dataset + generic fallback; EU refused like Django)
 - [x] `sendConfirmationEmail` + real SMTP (plain relay, Mailpit default; log-and-continue so mail never breaks flows)
 - [x] External auth roots: honest not-configured errors (no external plugin installed)
-- [ ] Avatars (`userAvatarUpdate/Delete` — multipart, see §6)
+- [x] `userAvatarUpdate/Delete` (staff-only, image-only, old file + thumbnail rows cleaned; `User.avatar` resolves /media/ URL)
 
 ## 10. Apps / webhooks / plugins
 - [x] Webhooks CRUD + dryRun (real object payloads) + `webhookTrigger` + `eventDeliveryRetry`, outbox fan-out/attempts/sweeper, `webhookEvents/samplePayload`
@@ -72,12 +72,12 @@ Legend: `[x]` real + tested · `[~]` real but bounded (documented) · `[ ]` miss
 ## 11. Invoices / settings / exports
 - [x] Invoices: request/send/create/update/delete/request-delete + `invoices` on orders
 - [x] Refund/return reason settings + queries, gift-card settings, shop settings translate
-- [x] CSV exports: products/gift-cards/voucher-codes (ALL/IDS) + `exportFiles`/`exportFile` reads, media-served downloads
-- [ ] XLSX output, filtered-export algebra, `delete_old_export_files` beat
+- [x] CSV+XLSX exports: products/gift-cards (ALL/IDS/FILTER) + voucher-codes + `exportFiles`/`exportFile` reads, media-served downloads; every job writes ExportEvent rows (started/success/failed)
+- [x] `delete_old_export_files` beat (real, Django-verbatim retention: eventless files or any event older than `EXPORT_FILES_TIMEDELTA`/30d go; storage unlinked, events deleted before files)
 
 ## 12. Non-GraphQL (each a project)
 - [x] SMTP transactional mail (plain relay, no TLS/auth — localhost-relay posture like Django's `EMAIL_HOST`)
-- [ ] Multipart upload (blocks §6 `fileUpload` + §9 avatars)
+- [x] Multipart upload (live 2026-09-25: `fileUpload`, avatars, product media images)
 - [ ] 30+ payment gateways (only Stripe skeleton)
 - [ ] Tax providers, preorders/C&C depth, Saleor Apps SDK beyond tokens
 - [ ] `update*SearchVector` beats (search is pg_trgm — equivalent by design)
@@ -103,7 +103,8 @@ dropped silently.
 | order/fulfillment/transaction/payment views (statuses, invoices, addresses, channel) | §3 [x] |
 | giftCards list/details/create/update/deactivate/adjust + full CRUD + assign/notes/resend/settings/bulk | §4 [x] |
 | giftCardCurrencies/Tags/Settings reads | §4 [x] (pre-existing, still live) |
-| exportGiftCards | §4 [x] + §11 [x] (CSV ALL/IDS) |
+| exportGiftCards | §4 [x] + §11 [x] (CSV+XLSX ALL/IDS/FILTER) |
+| `delete_old_export_files` beat | §11 [x] (real, Django-verbatim rule) |
 | stock/stocks reads, stockBulkUpdate, zone links, reservations/allocations/sweeper | §6 [x] (restored — was missing from first rewrite pass) |
 | promotions/rules CRUD/bulk, vouchers CRUD/catalogues/listings/codes | §5 [x] |
 | saleCreate/Update/Delete/BulkDelete/CataloguesAdd/Remove/ChannelListingUpdate + sale(s) queries | §5 [x] (this wave) |
@@ -117,13 +118,13 @@ dropped silently.
 | staff/customer/groups/addresses CRUD, password/register/confirm/delete, throttle, tokens, customer types, staffNotificationRecipient create/delete/**update** | §9 [x] (recipient update: this wave) |
 | accountAddressCreate/Update/Delete/SetDefaultAddress | §9 [x] (this wave) |
 | addressValidationRules, sendConfirmationEmail, external auth roots | §9 [x] (this wave; externals honestly error) |
-| userAvatarUpdate/Delete | §9 [ ] (multipart — unchanged) |
+| userAvatarUpdate/Delete | §9 [x] (live 2026-09-25) |
 | webhooks CRUD/dryRun/Trigger, eventDeliveryRetry, outbox/sweeper, webhookEvents/samplePayload/exportFiles | §10 [x] |
 | app/appInstallations queries, install/retry/delete-failed, CRUD/activate/tokens/problems, appTokenVerify, appProblemCreate/Dismiss, appReenableSyncWebhooks, externalNotificationTrigger | §10 [x] (this wave) |
 | pluginUpdate + plugin(s) queries | §10 [x] (this wave) |
 | invoices request/send/create/update/delete/request-delete + order.invoices | §11 [x] |
 | refund/return settings + queries, gift-card/shop-translate settings | §11 [x] (this wave) |
-| CSV exports (products/gift-cards/voucher-codes) + exportFiles/exportFile | §11 [x] (this wave) |
+| CSV+XLSX exports (products/gift-cards/voucher-codes, ALL/IDS/FILTER) + exportFiles/exportFile + ExportEvents | §11 [x] |
 | translates: single + bulk product/variant/attribute/value + promotion/rule/shop | §5 [x] (this wave) |
-| SMTP / multipart / gateways / tax providers / preorders / Apps SDK / search vectors | §12 (unchanged positions) |
+| SMTP / gateways / tax providers / preorders / Apps SDK / search vectors | §12 (multipart done 2026-09-25; rest unchanged) |
 | `_entities`/`_service` federation | N/A by design (single binary, no Apollo federation) |

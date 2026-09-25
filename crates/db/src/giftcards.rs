@@ -22,7 +22,8 @@ use uuid::Uuid;
 
 use crate::{
     entities::{
-        checkout_checkout_gift_cards, giftcard_giftcard, giftcard_giftcardevent,
+        checkout_checkout_gift_cards, giftcard_giftcard, giftcard_giftcard_tags,
+        giftcard_giftcardtag, giftcard_giftcardevent,
     },
     DbError, Result,
 };
@@ -729,4 +730,106 @@ pub async fn unassign(
     write_event(&txn, updated.id, "unassigned", json!({}), actor_id, None).await?;
     txn.commit().await?;
     Ok(updated)
+}
+
+/// List-page filter subset shared by the `giftCards` query shape and the
+/// FILTER export scope (same predicates as the dashboard list resolver:
+/// is_active/code-ilike/currency/created_by_email/used/products/tags plus
+/// user/balance ranges; `metadata` stays accepted-ignored like the list).
+#[derive(Default)]
+pub struct GiftCardListFilter {
+    pub is_active: Option<bool>,
+    pub code_like: Option<String>,
+    pub currency: Option<String>,
+    pub created_by_email: Option<String>,
+    pub used: Option<bool>,
+    pub product_ids: Vec<i32>,
+    pub tags: Vec<String>,
+    pub used_by_ids: Vec<i32>,
+    pub assigned_to_ids: Vec<i32>,
+    pub current_balance_gte: Option<rust_decimal::Decimal>,
+    pub current_balance_lte: Option<rust_decimal::Decimal>,
+    pub initial_balance_gte: Option<rust_decimal::Decimal>,
+    pub initial_balance_lte: Option<rust_decimal::Decimal>,
+}
+
+/// Ids matching the filter (ordered by id; empty filter = all).
+pub async fn giftcard_ids_filtered(
+    db: &impl ConnectionTrait,
+    f: &GiftCardListFilter,
+) -> Result<Vec<i32>> {
+    use crate::entities::giftcard_giftcard::{Column as GCol, Entity as GEnt};
+    use sea_orm::Condition;
+    let mut cond = Condition::all();
+    if let Some(a) = f.is_active {
+        cond = cond.add(GCol::IsActive.eq(a));
+    }
+    if let Some(c) = f.code_like.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        cond = cond.add(GCol::Code.like(format!("%{c}%")));
+    }
+    if let Some(c) = f.currency.as_ref().filter(|s| !s.trim().is_empty()) {
+        cond = cond.add(GCol::Currency.eq(c.trim()));
+    }
+    if let Some(e) = f.created_by_email.as_ref().filter(|s| !s.trim().is_empty()) {
+        cond = cond.add(GCol::CreatedByEmail.eq(e.trim()));
+    }
+    if let Some(u) = f.used {
+        cond = cond.add(if u {
+            GCol::UsedById.is_not_null()
+        } else {
+            GCol::UsedById.is_null()
+        });
+    }
+    if !f.product_ids.is_empty() {
+        cond = cond.add(GCol::ProductId.is_in(f.product_ids.clone()));
+    }
+    if !f.used_by_ids.is_empty() {
+        cond = cond.add(GCol::UsedById.is_in(f.used_by_ids.clone()));
+    }
+    if !f.assigned_to_ids.is_empty() {
+        cond = cond.add(GCol::AssignedToId.is_in(f.assigned_to_ids.clone()));
+    }
+    if let Some(g) = f.current_balance_gte {
+        cond = cond.add(GCol::CurrentBalanceAmount.gte(g));
+    }
+    if let Some(l) = f.current_balance_lte {
+        cond = cond.add(GCol::CurrentBalanceAmount.lte(l));
+    }
+    if let Some(g) = f.initial_balance_gte {
+        cond = cond.add(GCol::InitialBalanceAmount.gte(g));
+    }
+    if let Some(l) = f.initial_balance_lte {
+        cond = cond.add(GCol::InitialBalanceAmount.lte(l));
+    }
+    if !f.tags.is_empty() {
+        let tag_ids: Vec<i32> = giftcard_giftcardtag::Entity::find()
+            .select_only()
+            .column(giftcard_giftcardtag::Column::Id)
+            .filter(giftcard_giftcardtag::Column::Name.is_in(f.tags.clone()))
+            .into_tuple()
+            .all(db)
+            .await?;
+        if tag_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let card_ids: Vec<i32> = giftcard_giftcard_tags::Entity::find()
+            .select_only()
+            .column(giftcard_giftcard_tags::Column::GiftcardId)
+            .filter(giftcard_giftcard_tags::Column::GiftcardtagId.is_in(tag_ids))
+            .into_tuple()
+            .all(db)
+            .await?;
+        if card_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        cond = cond.add(GCol::Id.is_in(card_ids));
+    }
+    Ok(GEnt::find()
+        .select_only()
+        .column(GCol::Id)
+        .filter(cond)
+        .order_by_asc(GCol::Id)
+        .into_tuple()
+        .all(db)
+        .await?)
 }

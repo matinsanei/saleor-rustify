@@ -13,6 +13,7 @@ uuid = { workspace = true }
 rust_decimal = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 saleor-rustify-core = { path = "../core" }
 
 [dev-dependencies]

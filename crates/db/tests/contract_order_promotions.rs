@@ -157,6 +157,58 @@ async fn drop_promo(db: &DatabaseConnection, p: &Promo) {
     discount_promotion::Entity::delete_by_id(p.promo_id).exec(db).await.unwrap();
 }
 
+/// Deactivate every order promotion except `keep` (stash end_dates for
+/// restore). The engine evaluates ALL type=order rules, so populatedb seed
+/// promos (which activate on their own start_date) and leftovers from
+/// interrupted runs would otherwise leak into exact-discount assertions.
+/// The suite's `stock_guard` serializes these tests, so stash/restore here
+/// can't race a sibling test.
+async fn isolate_promos(
+    db: &DatabaseConnection,
+    keep: &[Uuid],
+) -> Vec<(Uuid, Option<chrono::DateTime<chrono::FixedOffset>>)> {
+    use saleor_rustify_db::entities::discount_promotion;
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, Set};
+    let all: Vec<(Uuid, Option<chrono::DateTime<chrono::FixedOffset>>)> =
+        discount_promotion::Entity::find()
+            .select_only()
+            .column(discount_promotion::Column::Id)
+            .column(discount_promotion::Column::EndDate)
+            .filter(discount_promotion::Column::Type.eq("order"))
+            .into_tuple()
+            .all(db)
+            .await
+            .unwrap();
+    let yesterday = chrono::Utc::now() - chrono::Duration::days(1);
+    let mut stash = Vec::new();
+    for (id, end) in all {
+        if keep.contains(&id) {
+            continue;
+        }
+        stash.push((id, end));
+        let mut am: discount_promotion::ActiveModel =
+            discount_promotion::Entity::find_by_id(id).one(db).await.unwrap().unwrap().into();
+        am.end_date = Set(Some(yesterday.into()));
+        am.update(db).await.unwrap();
+    }
+    stash
+}
+
+async fn restore_promos(
+    db: &DatabaseConnection,
+    stash: Vec<(Uuid, Option<chrono::DateTime<chrono::FixedOffset>>)>,
+) {
+    use saleor_rustify_db::entities::discount_promotion;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    for (id, end) in stash {
+        if let Some(row) = discount_promotion::Entity::find_by_id(id).one(db).await.unwrap() {
+            let mut am: discount_promotion::ActiveModel = row.into();
+            am.end_date = Set(end);
+            am.update(db).await.unwrap();
+        }
+    }
+}
+
 fn gte_predicate(amount: &str) -> serde_json::Value {
     json!({"discountedObjectPredicate": {"baseSubtotalPrice": {"range": {"gte": amount}}}})
 }
@@ -226,6 +278,7 @@ async fn percentage_discount_applies_over_threshold() {
     // Threshold at half the actual subtotal (fixture-agnostic).
     let gate = (subtotal / dec("2")).round_dp(2).to_string();
     let p = make_promo(&db, "ten-off", "subtotal_discount", Some("percentage"), Some(dec("10")), gte_predicate(&gate)).await;
+    let stash = isolate_promos(&db, &[p.promo_id]).await;
     checkout_store::refresh_totals(&db, token).await.unwrap();
     // 10% HALF_UP at USD precision.
     let want_disc = (subtotal * dec("10") / dec("100")).round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
@@ -237,6 +290,7 @@ async fn percentage_discount_applies_over_threshold() {
     }
     assert_eq!(promo_rows(&db, token).await, 1);
     assert_eq!(checkout_total(&db, token).await, (subtotal - want_disc).max(dec("0")));
+    restore_promos(&db, stash).await;
     drop_promo(&db, &p).await;
     checkout_store::delete_checkout_row(&db, token).await.unwrap();
 }
@@ -246,6 +300,10 @@ async fn fixed_caps_at_subtotal_and_gates_on_predicate() {
     let _guard = stock_guard();
     let db = db().await;
     let p = make_promo(&db, "huge-fixed", "subtotal_discount", Some("fixed"), Some(dec("1000")), gte_predicate("10")).await;
+    // Created upfront (its 100000 gate never matches case 1) so a single
+    // isolate/restore pair covers the whole test.
+    let p2 = make_promo(&db, "high-gate", "subtotal_discount", Some("percentage"), Some(dec("50")), gte_predicate("100000")).await;
+    let stash = isolate_promos(&db, &[p.promo_id, p2.promo_id]).await;
     let (token, _vid, unit) = stocked_checkout(&db, 1).await;
     let out = order_promotions::refresh_order_promotion(&db, token).await.unwrap();
     checkout_store::refresh_totals(&db, token).await.unwrap();
@@ -256,13 +314,13 @@ async fn fixed_caps_at_subtotal_and_gates_on_predicate() {
     assert_eq!(checkout_total(&db, token).await, dec("0"), "floored, never negative");
 
     // Shrink below the gate: nothing applies, rows cleared.
-    let p2 = make_promo(&db, "high-gate", "subtotal_discount", Some("percentage"), Some(dec("50")), gte_predicate("100000")).await;
     drop_promo(&db, &p).await;
     let out = order_promotions::refresh_order_promotion(&db, token).await.unwrap();
     checkout_store::refresh_totals(&db, token).await.unwrap();
     assert!(matches!(out, order_promotions::RefreshOutcome::Cleared));
     assert_eq!(promo_rows(&db, token).await, 0);
     assert_eq!(checkout_total(&db, token).await, unit);
+    restore_promos(&db, stash).await;
     drop_promo(&db, &p2).await;
     checkout_store::delete_checkout_row(&db, token).await.unwrap();
 }
@@ -272,6 +330,7 @@ async fn voucher_suppresses_order_promotion() {
     let _guard = stock_guard();
     let db = db().await;
     let p = make_promo(&db, "suppressed", "subtotal_discount", Some("percentage"), Some(dec("20")), gte_predicate("1")).await;
+    let stash = isolate_promos(&db, &[p.promo_id]).await;
     let (token, _vid, unit) = stocked_checkout(&db, 1).await;
     let out = order_promotions::refresh_order_promotion(&db, token).await.unwrap();
     checkout_store::refresh_totals(&db, token).await.unwrap();
@@ -289,6 +348,7 @@ async fn voucher_suppresses_order_promotion() {
     checkout_store::refresh_totals(&db, token).await.unwrap();
     assert!(matches!(out, order_promotions::RefreshOutcome::Cleared), "voucher wins");
     assert_eq!(promo_rows(&db, token).await, 0);
+    restore_promos(&db, stash).await;
     drop_promo(&db, &p).await;
     checkout_store::delete_checkout_row(&db, token).await.unwrap();
     let _ = unit;
@@ -315,6 +375,7 @@ async fn gift_line_created_free_and_competes_by_value() {
     // Case A: lone gift rule → gift wins, checkout total untouched.
     let g = make_promo(&db, "free-gift", "gift", None, None, gte_predicate("1")).await;
     link_gift(&db, g.rule_id, gift_vid).await;
+    let stash = isolate_promos(&db, &[g.promo_id]).await;
     let out = order_promotions::refresh_order_promotion(&db, token).await.unwrap();
     checkout_store::refresh_totals(&db, token).await.unwrap();
     let gift_line = match out {
@@ -351,6 +412,7 @@ async fn gift_line_created_free_and_competes_by_value() {
     }
     drop_promo(&db, &g).await;
     drop_promo(&db, &d).await;
+    restore_promos(&db, stash).await;
     checkout_store::delete_checkout_row(&db, token).await.unwrap();
 }
 
@@ -359,6 +421,7 @@ async fn complete_carries_discount_row_and_gift_line() {
     let _guard = stock_guard();
     let db = db().await;
     let p = make_promo(&db, "carry-ten", "subtotal_discount", Some("percentage"), Some(dec("10")), gte_predicate("1")).await;
+    let stash = isolate_promos(&db, &[p.promo_id]).await;
     let (token, _vid, unit) = stocked_checkout(&db, 2).await;
     let subtotal = unit * dec("2");
     let want_disc = (subtotal * dec("10") / dec("100")).round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
@@ -380,6 +443,7 @@ async fn complete_carries_discount_row_and_gift_line() {
         assert_eq!(d.promotion_rule_id, Some(p.rule_id));
     }
     assert!(lines.iter().all(|l| !l.is_gift));
+    restore_promos(&db, stash).await;
     drop_promo(&db, &p).await;
     // NOTE: completed order left in place (suite convention: complete tests
     // leave orders; allocations pin stock like the other suites).
@@ -409,6 +473,7 @@ async fn complete_carries_gift_line_with_allocation() {
     assert_ne!(gift_vid, 0);
     let g = make_promo(&db, "carry-gift", "gift", None, None, gte_predicate("1")).await;
     link_gift(&db, g.rule_id, gift_vid).await;
+    let stash = isolate_promos(&db, &[g.promo_id]).await;
     checkout_store::refresh_totals(&db, token).await.unwrap();
     assert_eq!(gift_lines(&db, token).await.len(), 1);
 
@@ -431,5 +496,6 @@ async fn complete_carries_gift_line_with_allocation() {
         .map(|a| a.quantity_allocated)
         .sum();
     assert_eq!(alloced, 1);
+    restore_promos(&db, stash).await;
     drop_promo(&db, &g).await;
 }

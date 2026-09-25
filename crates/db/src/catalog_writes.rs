@@ -1172,6 +1172,7 @@ pub async fn create_media(
         external_url: Set(external_url),
         product_id: Set(Some(product_id)),
         oembed_data: Set(json!({})),
+        to_remove: Set(false),
         metadata: Set(json!({})),
         private_metadata: Set(json!({})),
         ..Default::default()

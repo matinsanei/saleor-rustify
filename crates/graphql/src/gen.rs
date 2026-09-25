@@ -6,19 +6,6 @@
 use async_graphql::*;
 use chrono::{DateTime, Utc};
 
-use crate::common::PageInfo;
-
-
-#[derive(Clone, Debug)]
-pub struct GenUpload;
-
-#[Scalar(name = "Upload")]
-impl ScalarType for GenUpload {
-    fn parse(value: Value) -> InputValueResult<Self> {
-        match &value { Value::String(_) | Value::Null => Ok(GenUpload), _ => Err(InputValueError::expected_type(value)), }
-    }
-    fn to_value(&self) -> Value { Value::Null }
-}
 
 
 macro_rules! gen_string_scalar {
@@ -12218,7 +12205,7 @@ pub struct CategoryInput {
     pub seo: Option<SeoInput>,
 
     #[graphql(name = "backgroundImage")]
-    pub background_image: Option<GenUpload>,
+    pub background_image: Option<async_graphql::Upload>,
 
     #[graphql(name = "backgroundImageAlt")]
     pub background_image_alt: Option<String>,
@@ -12622,7 +12609,7 @@ pub struct CollectionCreateInput {
     pub description: Option<GenJSONString>,
 
     #[graphql(name = "backgroundImage")]
-    pub background_image: Option<GenUpload>,
+    pub background_image: Option<async_graphql::Upload>,
 
     #[graphql(name = "backgroundImageAlt")]
     pub background_image_alt: Option<String>,
@@ -12687,7 +12674,7 @@ pub struct CollectionInput {
     pub description: Option<GenJSONString>,
 
     #[graphql(name = "backgroundImage")]
-    pub background_image: Option<GenUpload>,
+    pub background_image: Option<async_graphql::Upload>,
 
     #[graphql(name = "backgroundImageAlt")]
     pub background_image_alt: Option<String>,
@@ -13980,7 +13967,7 @@ pub struct MediaInput {
     pub alt: Option<String>,
 
     #[graphql(name = "image")]
-    pub image: Option<GenUpload>,
+    pub image: Option<async_graphql::Upload>,
 
     #[graphql(name = "mediaUrl")]
     pub media_url: Option<String>,
@@ -16134,7 +16121,7 @@ pub struct ProductMediaCreateInput {
     pub alt: Option<String>,
 
     #[graphql(name = "image")]
-    pub image: Option<GenUpload>,
+    pub image: Option<async_graphql::Upload>,
 
     #[graphql(name = "product")]
     pub product: ID,
@@ -28108,9 +28095,16 @@ impl User {
     }
 
     #[graphql(name = "avatar")]
-    async fn avatar(&self, #[graphql(name = "size")] _arg_size: Option<i32>, #[graphql(name = "format")] _arg_format: Option<ThumbnailFormatEnum>) -> Option<crate::account::GqlImage> {
+    async fn avatar(&self, ctx: &Context<'_>, #[graphql(name = "size")] _arg_size: Option<i32>, #[graphql(name = "format")] _arg_format: Option<ThumbnailFormatEnum>) -> Option<crate::account::GqlImage> {
 
-        None
+        {
+        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();
+        crate::uploads::user_avatar(&db, &gid).await
+    }
 
     }
 
@@ -29341,13 +29335,6 @@ impl GenQuery {
 
     }
 
-    #[graphql(name = "checkouts")]
-    async fn checkouts(&self, #[graphql(name = "sortBy")] _arg_sort_by: Option<CheckoutSortingInput>, #[graphql(name = "filter")] _arg_filter: Option<CheckoutFilterInput>, #[graphql(name = "channel")] _arg_channel: Option<String>, #[graphql(name = "before")] _arg_before: Option<String>, #[graphql(name = "after")] _arg_after: Option<String>, #[graphql(name = "first")] _arg_first: Option<i32>, #[graphql(name = "last")] _arg_last: Option<i32>) -> Option<CheckoutCountableConnection> {
-
-        Some(CheckoutCountableConnection { edges: vec![], page_info: Some(PageInfo { has_next_page: false, has_previous_page: false, start_cursor: None, end_cursor: None }) })
-
-    }
-
 }
 
 
@@ -29368,27 +29355,6 @@ impl GenMutation {
     async fn menu_item_bulk_delete(&self, #[graphql(name = "ids")] _arg_ids: Vec<ID>) -> Option<MenuItemBulkDelete> {
 
         Some(MenuItemBulkDelete { errors: vec![] })
-
-    }
-
-    #[graphql(name = "fileUpload")]
-    async fn file_upload(&self, #[graphql(name = "file")] _arg_file: GenUpload) -> Option<FileUpload> {
-
-        Some(FileUpload { uploaded_file: None, errors: vec![] })
-
-    }
-
-    #[graphql(name = "userAvatarUpdate")]
-    async fn user_avatar_update(&self, #[graphql(name = "image")] _arg_image: GenUpload) -> Option<UserAvatarUpdate> {
-
-        Some(UserAvatarUpdate { user: None, errors: vec![] })
-
-    }
-
-    #[graphql(name = "userAvatarDelete")]
-    async fn user_avatar_delete(&self) -> Option<UserAvatarDelete> {
-
-        Some(UserAvatarDelete { user: None, errors: vec![] })
 
     }
 

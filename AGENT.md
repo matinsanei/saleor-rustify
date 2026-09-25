@@ -2,12 +2,13 @@
 
 Rust rewrite of Saleor on the **same PostgreSQL** (zero migration).
 Measured 2026-09-24: live SDL **91 queries / 346 mutations** (schema: 90/339 —
-every schema root resolves), dashboard harness **458/458**, DB contracts **171/171**.
+every schema root resolves), dashboard harness **458/458**, DB contracts **175/175**.
 
 ## Iron rules (learned the hard way)
 
 1. **Never hand-edit `crates/graphql/src/gen.rs`.** It is generated from
-   `saleor/dashboard/schema-main.graphql`. Fix `scripts/schema_codegen.py` and re-run.
+   `saleor-dashboard-3.23.33/schema-main.graphql` (pinned release tag).
+   Fix `scripts/schema_codegen.py` and re-run.
 2. **Root-name law.** A hand resolver MUST satisfy exactly one of:
    - Rust name camel-matches the schema root (`order_confirm` → `orderConfirm`), or
    - explicit `#[graphql(name = "orderNoteAdd")]`.
@@ -80,7 +81,7 @@ python3 scripts/verify_dashboard_ops.py   # expect TESTED=458 FAILED=0
   `DbError` per-domain variants (`Order`, `Draft`, `GiftCardNotApplicable`…).
 - `crates/graphql` — translation layer only. Sections: `order`, `payment`,
   `checkout`, `catalog`, `commerce`, `account`, `apps`, `translations`,
-  `metadata` + `common` (gid/parse, money, metadata merge) + `mail` (SMTP).
+  `uploads` (multipart: file/avatar/product-image), `metadata` + `common` (gid/parse, money, metadata merge) + `mail` (SMTP).
   Hand payloads are `Gql*` with explicit `#[graphql(name = "...")]`
   (e.g. `GqlOrderCancel` → `OrderCancel`); dashboard-selected shapes are
   reused from `gen::` directly.
@@ -109,16 +110,23 @@ python3 scripts/verify_dashboard_ops.py   # expect TESTED=458 FAILED=0
 
 ## Known gaps (don't re-discover)
 
-- Multipart upload missing → `fileUpload`, `userAvatar*` are stubs; product
-  media create takes `mediaUrl`. axum needs the `multipart` feature (multer
-  3.1.0 is in the cargo cache).
-- `checkouts` list needs full `gen::Checkout` assembly (biggest single gap).
+- Multipart upload is live (`uploads.rs`: `fileUpload`, `userAvatar*`,
+  `ProductMediaCreate.image`; server POST parses multipart via
+  `async_graphql::http::receive_body`). `Upload` scalar = real
+  `async_graphql::Upload` (codegen maps it; never reintroduce a stub scalar
+  named `Upload` — duplicate registration panics at schema build).
+- `checkouts` list is live (`checkout.rs`: channel/filter/sort/paginate over real rows).
 - Only Stripe skeleton + manual PSP; Adyen/30+ gateways missing.
 - No tax providers; `shopFetchTaxRates` honestly reports none configured.
 - SMTP is plain relay, no TLS/auth (`RUSTIFY_SMTP_HOST/PORT`, default
   `127.0.0.1:1025` → Mailpit). Mails log-and-continue, never break flows.
-- CSV only (no XLSX), export scope ALL/IDS (FILTER refused), no replacement
-  orders, external-auth plugins absent (honest errors), `saleor-db` container
+- Exports are CSV+XLSX, scope ALL/IDS/FILTER (FILTER resolves via the same
+  list predicates), ExportEvents feed the real `delete-old-export-files`
+  beat. Promotion contract tests isolate seed promos (`isolate_promos` +
+  `stock_guard` — the engine evaluates ALL global rules, and populatedb
+  promos activate on their start_date, so exact-discount tests go red
+  otherwise).
+- No replacement orders, external-auth plugins absent (honest errors), `saleor-db` container
   is unstable (`Exit 255` idle — `restart: unless-stopped` set; watch it).
 - Seed was wiped 2026-09-20, never re-run `populatedb`. `/tmp/*.json`,
   `/tmp/opencode/tok.txt` are volatile (IR lives at `/tmp/schema_ir.json`).

@@ -52,7 +52,7 @@ pub(crate) fn str_filter(f: Option<gen::StringFilterInput>) -> (Option<String>, 
 }
 
 /// Merge one where-level's flat fields (no AND/OR) into the DB filter.
-fn merge_where_flat(f: &mut saleor_rustify_db::catalog::ProductListFilter, w: &gen::ProductWhereInput) {
+pub(crate) fn merge_where_flat(f: &mut saleor_rustify_db::catalog::ProductListFilter, w: &gen::ProductWhereInput) {
     f.ids.extend(gid_vec(w.ids.clone()));
     let (neq, none_of) = str_filter(w.name.clone());
     if neq.is_some() { f.name_eq = neq; }
@@ -65,6 +65,29 @@ fn merge_where_flat(f: &mut saleor_rustify_db::catalog::ProductListFilter, w: &g
     f.collection_ids.extend(gid_filter(w.collection.clone()));
     if w.is_published.is_some() { f.is_published = w.is_published; }
     if w.has_category.is_some() { f.has_category = w.has_category; }
+}
+
+/// Translate the deprecated `ProductFilterInput` (+ free search) into the DB
+/// filter. Shared by the `products` list and the FILTER export scope (same
+/// supported subset, same accepted-ignored gaps: price/attribute/stock/date/
+//// metadata sub-filters).
+pub(crate) fn product_list_filter(
+    filter: Option<&gen::ProductFilterInput>,
+    search: Option<String>,
+) -> saleor_rustify_db::catalog::ProductListFilter {
+    let mut f = saleor_rustify_db::catalog::ProductListFilter::default();
+    if let Some(flt) = filter {
+        f.ids.extend(gid_vec(flt.ids.clone()));
+        f.slugs.extend(flt.slugs.clone().unwrap_or_default());
+        f.collection_ids.extend(gid_vec(flt.collections.clone()));
+        f.category_ids.extend(gid_vec(flt.categories.clone()));
+        f.product_type_ids.extend(gid_vec(flt.product_types.clone()));
+        if flt.is_published.is_some() { f.is_published = flt.is_published; }
+        if flt.has_category.is_some() { f.has_category = flt.has_category; }
+        if f.search.is_none() { f.search = flt.search.clone(); }
+    }
+    if f.search.is_none() { f.search = search; }
+    f
 }
 
 /// Resolve AND/OR nesting to an id set (`None` = unconstrained). Branches are
@@ -460,19 +483,7 @@ impl CatalogQuery {
         let ch = channel.unwrap_or_else(|| "default-channel".into());
         let off = after.and_then(|c| decode_cursor(&c)).unwrap_or(0);
         let lim = first.unwrap_or(20).clamp(1, 100) as usize;
-        let mut f = saleor_rustify_db::catalog::ProductListFilter::default();
-        // Deprecated filter input (dashboard search boxes still send it).
-        if let Some(flt) = filter.as_ref() {
-            f.ids.extend(gid_vec(flt.ids.clone()));
-            f.slugs.extend(flt.slugs.clone().unwrap_or_default());
-            f.collection_ids.extend(gid_vec(flt.collections.clone()));
-            f.category_ids.extend(gid_vec(flt.categories.clone()));
-            f.product_type_ids.extend(gid_vec(flt.product_types.clone()));
-            if flt.is_published.is_some() { f.is_published = flt.is_published; }
-            if flt.has_category.is_some() { f.has_category = flt.has_category; }
-            if f.search.is_none() { f.search = flt.search.clone(); }
-        }
-        if f.search.is_none() { f.search = search.clone(); }
+        let mut f = product_list_filter(filter.as_ref(), search.clone());
         // Where input (ConditionalFilter): flat fields + AND/OR nesting.
         if let Some(w) = where_input.as_ref() {
             merge_where_flat(&mut f, w);
@@ -2006,16 +2017,23 @@ impl CatalogWriteMutation {
         Ok(gen::ProductVariantStocksDelete { product_variant: None, errors })
     }
 
-    /// Dashboard `ProductMediaCreate` (URL/external media; Upload rides fileUpload).
+    /// Dashboard `ProductMediaCreate` (Upload via multipart, else mediaUrl).
+    /// Image uploads ride the same validation/storage as `fileUpload`
+    /// (Django `upload_to="products"`).
     async fn product_media_create(&self, ctx: &Context<'_>, input: gen::ProductMediaCreateInput) -> Result<gen::ProductMediaCreate> {
         let _ = crate::account::require_perm(ctx, "manage_products").await?;
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
         let err = |m: String| gen::ProductMediaCreate { product: None, media: None, errors: vec![perr(None, m)] };
         let pid = saleor_rustify_db::catalog::parse_gid(&input.product.0).unwrap_or(-1);
-        if input.image.is_some() {
-            return Ok(err("multipart upload rides fileUpload; pass mediaUrl instead".into()));
+        let mut image_path: Option<String> = None;
+        if let Some(up) = input.image.as_ref() {
+            let stored = crate::uploads::read_upload(ctx, up).await.map_err(Error::new)?;
+            if let Err(e) = crate::uploads::check_file(&stored.filename, &stored.bytes, true) {
+                return Ok(err(e));
+            }
+            image_path = Some(crate::uploads::save_upload("products", &stored.filename, &stored.bytes).map_err(Error::new)?);
         }
-        match saleor_rustify_db::catalog_writes::create_media(db, pid, &input.alt.clone().unwrap_or_default(), None, input.media_url.clone()).await {
+        match saleor_rustify_db::catalog_writes::create_media(db, pid, &input.alt.clone().unwrap_or_default(), image_path, input.media_url.clone()).await {
             Ok(mid) => Ok(gen::ProductMediaCreate { product: None, media: assemble_media(db, mid).await?, errors: vec![] }),
             Err(e) => Ok(err(e.to_string())),
         }

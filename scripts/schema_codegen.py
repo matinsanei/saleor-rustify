@@ -29,8 +29,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 IR = "/tmp/schema_ir.json"
 SCHEMA = os.environ.get(
     "SALEOR_SCHEMA",
-    # Must match schema_examine.py: the dashboard's own schema-main.graphql.
-    "/home/matin/Desktop/dev/saleor/dashboard/schema-main.graphql",
+    # Must match schema_examine.py: the dashboard's own schema-main.graphql,
+    # pinned at the 3.23.33 release tag (never moves, unlike the rolling
+    # master checkout).
+    "/home/matin/Desktop/dev/saleor-dashboard-3.23.33/schema-main.graphql",
 )
 DASH_SRC = "/home/matin/Desktop/dev/saleor/dashboard/src"
 OUT = os.path.join(SCRIPT_DIR, "..", "crates", "graphql", "src", "gen.rs")
@@ -227,7 +229,7 @@ SCALAR_MAP = {
     "Minute": "i32", "UUID": "String", "JSONString": "String",
     "JSON": "serde_json::Value", "GenericScalar": "serde_json::Value",
     "Metadata": "serde_json::Value", "WeightScalar": "serde_json::Value",
-    "PositiveInt": "i32", "Upload": "GenUpload", "_Any": "String",
+    "PositiveInt": "i32", "Upload": "async_graphql::Upload", "_Any": "String",
 }
 
 
@@ -714,6 +716,17 @@ REAL_METHODS = {
             },
         })
     }""",
+    # Staff/customer avatar (account_user.avatar path → /media/ URL).
+    # Size/format args accepted-ignored (original served; no
+    # VersatileImageField rendition pipeline yet — same posture as thumbnails).
+    ("User", "avatar"): """{
+        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();
+        crate::uploads::user_avatar(&db, &gid).await
+    }""",
     # Product/line thumbnails: first product image as /media/<path>
     # (SALEOR_MEDIA_URL prefix). Size/format args accepted-ignored (original
     # served; no VersatileImageField pipeline yet).
@@ -858,16 +871,13 @@ def emit_all(reg, g, M):
     def gql_name(t):
         return t
 
-    # ---- Upload scalar (multipart deferred; JSON-string stub keeps SDL valid) ----
-    W("\n#[derive(Clone, Debug)]\npub struct GenUpload;\n")
-    W("#[Scalar(name = \"Upload\")]\nimpl ScalarType for GenUpload {\n"
-      "    fn parse(value: Value) -> InputValueResult<Self> {\n"
-      "        match &value { Value::String(_) | Value::Null => Ok(GenUpload), _ => Err(InputValueError::expected_type(value)), }\n"
-      "    }\n"
-      "    fn to_value(&self) -> Value { Value::Null }\n}\n")
+    # ---- Upload scalar: the REAL async-graphql multipart Upload
+    # (graphql-multipart-request-spec; server accepts multipart POST since
+    # 2026-09-25). The old GenUpload JSON-string stub is gone — two ScalarType
+    # impls named "Upload" would panic at schema build with duplicate scalar.
     for k in list(SCALAR_MAP):
         if k == "Upload":
-            SCALAR_MAP[k] = "GenUpload"
+            SCALAR_MAP[k] = "async_graphql::Upload"
     # ---- String-backed Saleor scalars (wire-compatible: Saleor serializes
     # Decimal/PositiveDecimal/JSONString as JSON strings). WeightScalar is
     # lenient (accepts numbers too) since variants send raw weights.
@@ -1162,7 +1172,15 @@ def emit_all(reg, g, M):
         W("\n    }")
     W("\n}\n")
 
-    open(OUT, "w").write("\n".join(O) + "\n")
+    body = "\n".join(O) + "\n"
+    # Bare `PageInfo` is only referenced by generated connection-stub bodies
+    # (fully-qualified `crate::common::PageInfo` uses don't need it). Once no
+    # stub uses it (e.g. `checkouts` grew a hand resolver), drop the import
+    # instead of shipping an unused-import warning.
+    probe = body.replace("use crate::common::PageInfo;\n", "").replace("::PageInfo", "")
+    if "PageInfo" not in probe:
+        body = body.replace("use crate::common::PageInfo;\n", "")
+    open(OUT, "w").write(body)
     print(f"WROTE {OUT} ({sum(len(x) for x in O)//1024} KiB)")
     for r in sorted(set(M["reports"]))[:40]:
         print(f"  GEN-NOTE: {r}")

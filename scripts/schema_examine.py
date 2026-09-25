@@ -32,7 +32,9 @@ SALEOR_SCHEMA = os.environ.get(
     # schema.graphql, which already dropped fields the dashboard selects
     # (filterableInStorefront et al). Codegen input must be the exact schema
     # the dashboard's hooks were generated against: zero version-skew class.
-    "/home/matin/Desktop/dev/saleor/dashboard/schema-main.graphql",
+    # Pinned at the 3.23.33 release tag (immutable); the rolling master
+    # checkout at ../saleor/dashboard would silently drift on git pull.
+    "/home/matin/Desktop/dev/saleor-dashboard-3.23.33/schema-main.graphql",
 )
 DASH_SRC = "/home/matin/Desktop/dev/saleor/dashboard/src"
 OUR_GQL = os.path.join(SCRIPT_DIR, "..", "crates", "graphql", "src")

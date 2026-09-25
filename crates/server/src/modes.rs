@@ -219,6 +219,19 @@ fn beat_entries() -> Vec<BeatEntry> {
             }
         })
     }
+    // Saleor: saleor.csv.tasks.delete_old_export_files, daily 01:00.
+    // Retention rule is Django-verbatim (see exports::prune_old_export_files).
+    fn delete_old_export_files(
+        db: &DatabaseConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match saleor_rustify_db::exports::prune_old_export_files(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[delete-old-export-files]: dropped {n}"),
+                Err(e) => tracing::warn!("beat[delete-old-export-files] failed: {e}"),
+            }
+        })
+    }
     vec![
         BeatEntry { name: "delete-expired-reservations", saleor_task: "saleor.warehouse.tasks.delete_expired_reservations_task", interval_secs: 60, job: Real(sweep_expired_reservations) },
         // --- deferred: schedule present, logic lands with its domain port ---
@@ -229,7 +242,7 @@ fn beat_entries() -> Vec<BeatEntry> {
         BeatEntry { name: "delete-outdated-event-data", saleor_task: "saleor.core.tasks.delete_event_payloads_task", interval_secs: 24 * 3600, job: Deferred },
         BeatEntry { name: "deactivate-expired-gift-cards", saleor_task: "saleor.giftcard.tasks.deactivate_expired_cards_task", interval_secs: 24 * 3600, job: Deferred },
         BeatEntry { name: "update-stocks-quantity-allocated", saleor_task: "saleor.warehouse.tasks.update_stocks_quantity_allocated_task", interval_secs: 24 * 3600, job: Deferred },
-        BeatEntry { name: "delete-old-export-files", saleor_task: "saleor.csv.tasks.delete_old_export_files", interval_secs: 24 * 3600, job: Deferred },
+        BeatEntry { name: "delete-old-export-files", saleor_task: "saleor.csv.tasks.delete_old_export_files", interval_secs: 24 * 3600, job: Real(delete_old_export_files) },
         // Saleor: DB-driven promotion-toggle schedule; we poll daily until ported.
         BeatEntry { name: "handle-promotion-toggle", saleor_task: "saleor.discount.tasks.handle_promotion_toggle", interval_secs: 24 * 3600, job: Deferred },
         // Saleor: every ~60s (search-index rebuild checks).

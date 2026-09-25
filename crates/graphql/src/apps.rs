@@ -468,6 +468,31 @@ async fn load_extensions(
     Ok(out)
 }
 
+/// Channel slug for channel-dependent export filters (Django injects the
+/// channel into the filter scope the same way): first `exportInfo` channel,
+/// else default-channel.
+async fn channel_slug_for_export(
+    db: &sea_orm::DatabaseConnection,
+    info: Option<&gen::ExportInfoInput>,
+) -> String {
+    let cid = info
+        .and_then(|i| i.channels.clone().unwrap_or_default().into_iter().next())
+        .and_then(|c| saleor_rustify_db::catalog::parse_gid(&c.0));
+    if let Some(id) = cid {
+        use sea_orm::{EntityTrait, QuerySelect};
+        if let Ok(Some(slug)) = saleor_rustify_db::entities::channel_channel::Entity::find_by_id(id)
+            .select_only()
+            .column(saleor_rustify_db::entities::channel_channel::Column::Slug)
+            .into_tuple::<String>()
+            .one(db)
+            .await
+        {
+            return slug;
+        }
+    }
+    "default-channel".to_string()
+}
+
 #[derive(Default)]
 pub struct AppsMutation;
 
@@ -670,8 +695,11 @@ impl AppsMutation {
         }
     }
 
-    /// Export products to CSV (Django `exportProducts`): synchronous file
-    /// job, ALL/IDS scope, served from the media mount.
+    /// Export products to CSV/XLSX (Django `exportProducts`): synchronous file
+    /// job, ALL/IDS/FILTER scope, served from the media mount. FILTER
+    /// resolves through the same list-filter predicates (channel from
+    /// `exportInfo.channels`, else default-channel — Django injects the
+    /// channel for channel-dependent filters the same way).
     async fn export_products(&self, ctx: &Context<'_>, input: gen::ExportProductsInput) -> Result<GqlExportProducts> {
         let _ = crate::account::require_perm(ctx, "manage_products").await?;
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
@@ -680,26 +708,32 @@ impl AppsMutation {
             export_file: None,
             errors: vec![gen::ExportError { field: None, message: Some(m), code: None }],
         };
-        if !matches!(input.file_type, gen::FileTypesEnum::CSV) {
-            return Ok(err("only CSV export is supported".into()));
-        }
-        if matches!(input.scope, gen::ExportScope::FILTER) && input.filter.is_some() {
-            return Ok(err("filtered export is not supported; pass ids or export all".into()));
-        }
+        let format = match input.file_type {
+            gen::FileTypesEnum::CSV => saleor_rustify_db::exports::ExportFormat::Csv,
+            gen::FileTypesEnum::XLSX => saleor_rustify_db::exports::ExportFormat::Xlsx,
+        };
         let ids = match input.scope {
             gen::ExportScope::IDS => Some(
                 input.ids.clone().unwrap_or_default().iter()
                     .filter_map(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).collect::<Vec<_>>(),
             ),
+            gen::ExportScope::FILTER => {
+                let Some(flt) = input.filter.as_ref() else {
+                    return Ok(err("You must provide filter input.".into()));
+                };
+                let ch = channel_slug_for_export(db, input.export_info.as_ref()).await;
+                let f = crate::catalog::product_list_filter(Some(flt), None);
+                Some(saleor_rustify_db::catalog::product_ids_filtered(db, &ch, &f).await.map_err(|e| Error::new(e.to_string()))?)
+            }
             _ => None,
         };
-        match saleor_rustify_db::exports::export_products(db, Some(uid), ids).await {
+        match saleor_rustify_db::exports::export_products(db, Some(uid), ids, format).await {
             Ok(job) => Ok(GqlExportProducts { export_file: export_file_view(db, job).await?, errors: vec![] }),
             Err(e) => Ok(err(e.to_string())),
         }
     }
 
-    /// Export gift cards to CSV (Django `exportGiftCards`).
+    /// Export gift cards to CSV/XLSX (Django `exportGiftCards`).
     async fn export_gift_cards(&self, ctx: &Context<'_>, input: gen::ExportGiftCardsInput) -> Result<GqlExportGiftCards> {
         let _ = crate::account::require_perm(ctx, "manage_gift_card").await?;
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
@@ -708,26 +742,48 @@ impl AppsMutation {
             export_file: None,
             errors: vec![gen::ExportError { field: None, message: Some(m), code: None }],
         };
-        if !matches!(input.file_type, gen::FileTypesEnum::CSV) {
-            return Ok(err("only CSV export is supported".into()));
-        }
-        if matches!(input.scope, gen::ExportScope::FILTER) && input.filter.is_some() {
-            return Ok(err("filtered export is not supported; pass ids or export all".into()));
-        }
+        let format = match input.file_type {
+            gen::FileTypesEnum::CSV => saleor_rustify_db::exports::ExportFormat::Csv,
+            gen::FileTypesEnum::XLSX => saleor_rustify_db::exports::ExportFormat::Xlsx,
+        };
         let ids = match input.scope {
             gen::ExportScope::IDS => Some(
                 input.ids.clone().unwrap_or_default().iter()
                     .filter_map(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).collect::<Vec<_>>(),
             ),
+            gen::ExportScope::FILTER => {
+                let Some(flt) = input.filter.as_ref() else {
+                    return Ok(err("You must provide filter input.".into()));
+                };
+                let f = saleor_rustify_db::giftcards::GiftCardListFilter {
+                    is_active: flt.is_active,
+                    code_like: flt.code.clone(),
+                    currency: flt.currency.clone(),
+                    created_by_email: flt.created_by_email.clone(),
+                    used: flt.used,
+                    product_ids: flt.products.clone().unwrap_or_default().iter()
+                        .filter_map(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).collect(),
+                    tags: flt.tags.clone().unwrap_or_default(),
+                    used_by_ids: flt.used_by.clone().unwrap_or_default().iter()
+                        .filter_map(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).collect(),
+                    assigned_to_ids: flt.assigned_to.clone().unwrap_or_default().iter()
+                        .filter_map(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).collect(),
+                    current_balance_gte: flt.current_balance.as_ref().and_then(|r| r.gte).map(rust_decimal::Decimal::from_f64_retain).flatten(),
+                    current_balance_lte: flt.current_balance.as_ref().and_then(|r| r.lte).map(rust_decimal::Decimal::from_f64_retain).flatten(),
+                    initial_balance_gte: flt.initial_balance.as_ref().and_then(|r| r.gte).map(rust_decimal::Decimal::from_f64_retain).flatten(),
+                    initial_balance_lte: flt.initial_balance.as_ref().and_then(|r| r.lte).map(rust_decimal::Decimal::from_f64_retain).flatten(),
+                };
+                Some(saleor_rustify_db::giftcards::giftcard_ids_filtered(db, &f).await.map_err(|e| Error::new(e.to_string()))?)
+            }
             _ => None,
         };
-        match saleor_rustify_db::exports::export_gift_cards(db, Some(uid), ids).await {
+        match saleor_rustify_db::exports::export_gift_cards(db, Some(uid), ids, format).await {
             Ok(job) => Ok(GqlExportGiftCards { export_file: export_file_view(db, job).await?, errors: vec![] }),
             Err(e) => Ok(err(e.to_string())),
         }
     }
 
-    /// Export voucher codes to CSV (Django `exportVoucherCodes`).
+    /// Export voucher codes to CSV/XLSX (Django `exportVoucherCodes`).
     async fn export_voucher_codes(&self, ctx: &Context<'_>, input: gen::ExportVoucherCodesInput) -> Result<GqlExportVoucherCodes> {        let _ = crate::account::require_perm(ctx, "manage_discounts").await?;
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
         let (uid, _) = crate::account::requester(ctx, db).await.unwrap_or((0, String::new()));
@@ -735,14 +791,15 @@ impl AppsMutation {
             export_file: None,
             errors: vec![gen::ExportError { field: None, message: Some(m), code: None }],
         };
-        if !matches!(input.file_type, gen::FileTypesEnum::CSV) {
-            return Ok(err("only CSV export is supported".into()));
-        }
+        let format = match input.file_type {
+            gen::FileTypesEnum::CSV => saleor_rustify_db::exports::ExportFormat::Csv,
+            gen::FileTypesEnum::XLSX => saleor_rustify_db::exports::ExportFormat::Xlsx,
+        };
         let vid = input.voucher_id.as_ref().and_then(|v| saleor_rustify_db::catalog::parse_gid(&v.0));
         let cids = input.ids.clone().map(|ids| {
             ids.iter().filter_map(|i| crate::common::parse_uuid_gid(&i.0)).collect::<Vec<_>>()
         });
-        match saleor_rustify_db::exports::export_voucher_codes(db, Some(uid), vid, cids).await {
+        match saleor_rustify_db::exports::export_voucher_codes(db, Some(uid), vid, cids, format).await {
             Ok(job) => Ok(GqlExportVoucherCodes { export_file: export_file_view(db, job).await?, errors: vec![] }),
             Err(e) => Ok(err(e.to_string())),
         }

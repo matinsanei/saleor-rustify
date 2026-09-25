@@ -277,7 +277,7 @@ async fn user_group_ids(db: &sea_orm::DatabaseConnection, uid: i32) -> Result<Ve
 
 /// Full user assembly: identity + addresses + defaults + groups +
 /// permissions + channels (dashboard details pages read all of these).
-async fn assemble_user(db: &sea_orm::DatabaseConnection, uid: i32, claims_user_id: &str) -> Result<gen::User, String> {
+pub(crate) async fn assemble_user(db: &sea_orm::DatabaseConnection, uid: i32, claims_user_id: &str) -> Result<gen::User, String> {
     let user = saleor_rustify_db::entities::account_user::Entity::find_by_id(uid)
         .one(db).await.map_err(|e| e.to_string())?
         .ok_or_else(|| "user not found".to_string())?;
