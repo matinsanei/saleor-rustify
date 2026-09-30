@@ -44,7 +44,7 @@ Legend: `[x]` real + tested · `[~]` real but bounded (documented) · `[ ]` miss
 - [x] Product types CRUD + `productType(s)`, `productVariant(s)` queries
 - [x] `attributeBulkCreate/Update`
 - [x] Stock: `stock(s)` reads, `stockBulkUpdate`, zone links, reservations/allocations, sweeper beat
-- [x] `fileUpload` (real multipart per graphql-multipart-request-spec: magic-bytes mime check vs Django allowlist + ext match, `file_upload/<name>_<hash><ext>`, served via /media/); `ProductMediaCreate.image` Upload live (stored under `products/`). Category/collection `backgroundImage` Upload inputs typecheck but stay accepted-ignored (reads resolve real paths)
+- [x] `fileUpload` (real multipart per graphql-multipart-request-spec: magic-bytes mime check vs Django allowlist + ext match, `file_upload/<name>_<hash><ext>`, served via /media/; RAM-buffered with 20MiB cap `RUSTIFY_MAX_UPLOAD_BYTES`; cleanup never escapes media root); `ProductMediaCreate.image` Upload live (stored under `products/`). Category/collection `backgroundImage` Upload inputs typecheck but stay accepted-ignored (reads resolve real paths)
 
 ## 7. Menus / pages
 - [x] Menus/items CRUD + move (MPTT rebuilt), navigation assign, `menu(s)/menuItem(s)` reads

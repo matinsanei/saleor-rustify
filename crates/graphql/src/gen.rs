@@ -7972,6 +7972,24 @@ pub enum ProductFieldEnum {
 
 
 #[derive(Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProductMediaTranslateErrorCode {
+
+    #[graphql(name = "GRAPHQL_ERROR")]
+    GRAPHQLERROR,
+
+    #[graphql(name = "INVALID")]
+    INVALID,
+
+    #[graphql(name = "NOT_FOUND")]
+    NOTFOUND,
+
+    #[graphql(name = "REQUIRED")]
+    REQUIRED,
+
+}
+
+
+#[derive(Enum, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProductMediaType {
 
     #[graphql(name = "IMAGE")]
@@ -8150,6 +8168,9 @@ pub enum ProductVariantSortField {
 
     #[graphql(name = "LAST_MODIFIED_AT")]
     LASTMODIFIEDAT,
+
+    #[graphql(name = "ID")]
+    ID,
 
 }
 
@@ -9230,6 +9251,9 @@ pub enum TranslatableKinds {
 
     #[graphql(name = "PRODUCT")]
     PRODUCT,
+
+    #[graphql(name = "PRODUCT_MEDIA")]
+    PRODUCTMEDIA,
 
     #[graphql(name = "PROMOTION")]
     PROMOTION,
@@ -16133,6 +16157,16 @@ pub struct ProductMediaCreateInput {
 
 
 #[derive(InputObject, Clone, Debug)]
+#[graphql(name = "ProductMediaTranslationInput")]
+pub struct ProductMediaTranslationInput {
+
+    #[graphql(name = "alt")]
+    pub alt: Option<String>,
+
+}
+
+
+#[derive(InputObject, Clone, Debug)]
 #[graphql(name = "ProductMediaUpdateInput")]
 pub struct ProductMediaUpdateInput {
 
@@ -20575,7 +20609,7 @@ impl Collection {
             None => return None,
         };
         let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();
-        crate::catalog::collection_products(&db, &gid, _arg_first.clone(), _arg_after.clone()).await
+        crate::catalog::collection_products(&db, &gid, crate::catalog::request_channel(ctx).as_deref(), _arg_first.clone(), _arg_after.clone()).await
     }
 
     }
@@ -23974,6 +24008,21 @@ pub struct Page {
 #[ComplexObject]
 impl Page {
 
+    #[graphql(name = "translation")]
+    async fn translation(&self, ctx: &Context<'_>, #[graphql(name = "languageCode")] _arg_language_code: LanguageCodeEnum) -> Option<PageTranslation> {
+
+        {
+        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        let eid: i32 = self.id.as_ref().and_then(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).unwrap_or(-1);
+        let lang = crate::gen::language_code_value(&_arg_language_code);
+        crate::translations::page_translation(&db, eid, lang).await
+    }
+
+    }
+
     pub async fn gen_iface_id(&self) -> Option<ID> {
 
         self.id.clone()
@@ -24674,6 +24723,12 @@ pub struct Product {
     #[graphql(name = "taxClass")]
     pub tax_class: Option<TaxClass>,
 
+    #[graphql(name = "variants")]
+    pub variants: Option<Vec<ProductVariant>>,
+
+    #[graphql(name = "externalReference")]
+    pub external_reference: Option<String>,
+
 }
 
 
@@ -24750,6 +24805,20 @@ impl Product {
         let eid: i32 = self.id.as_ref().and_then(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).unwrap_or(-1);
         let lang = crate::gen::language_code_value(&_arg_language_code);
         crate::translations::product_translation(&db, eid, lang).await
+    }
+
+    }
+
+    #[graphql(name = "pricing")]
+    async fn pricing(&self, ctx: &Context<'_>, #[graphql(name = "address")] _arg_address: Option<AddressInput>) -> Option<ProductPricingInfo> {
+
+        {
+        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();
+        crate::catalog::product_pricing_info(&db, &gid, crate::catalog::request_channel(ctx).as_deref()).await
     }
 
     }
@@ -25412,9 +25481,16 @@ pub struct ProductVariant {
 impl ProductVariant {
 
     #[graphql(name = "pricing")]
-    async fn pricing(&self, #[graphql(name = "address")] _arg_address: Option<AddressInput>) -> Option<VariantPricingInfo> {
+    async fn pricing(&self, ctx: &Context<'_>, #[graphql(name = "address")] _arg_address: Option<AddressInput>) -> Option<VariantPricingInfo> {
 
-        None
+        {
+        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();
+        crate::catalog::variant_pricing_info(&db, &gid, crate::catalog::request_channel(ctx).as_deref()).await
+    }
 
     }
 
@@ -26510,6 +26586,21 @@ pub struct ShippingMethod {
 
 #[ComplexObject]
 impl ShippingMethod {
+
+    #[graphql(name = "translation")]
+    async fn translation(&self, ctx: &Context<'_>, #[graphql(name = "languageCode")] _arg_language_code: LanguageCodeEnum) -> Option<ShippingMethodTranslation> {
+
+        {
+        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        let eid: i32 = self.id.as_ref().and_then(|i| saleor_rustify_db::catalog::parse_gid(&i.0)).unwrap_or(-1);
+        let lang = crate::gen::language_code_value(&_arg_language_code);
+        crate::translations::shipping_method_translation(&db, eid, lang).await
+    }
+
+    }
 
     pub async fn gen_iface_id(&self) -> Option<ID> {
 

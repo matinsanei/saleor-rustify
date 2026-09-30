@@ -490,7 +490,7 @@ async fn channel_slug_for_export(
             return slug;
         }
     }
-    "default-channel".to_string()
+    saleor_rustify_db::catalog::fallback_channel_slug()
 }
 
 #[derive(Default)]

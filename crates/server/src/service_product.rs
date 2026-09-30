@@ -43,9 +43,11 @@ impl ProductService for ProductServiceImpl {
     ) -> Result<Response<GetProductResponse>, Status> {
         let id = request.into_inner().id;
         if let Some(db) = &self.db {
-            let channel = "default-channel";
+            // NOTE: GetProductRequest carries no channel (proto-frozen);
+            // single-product fetch resolves against the deployment default.
+            let channel = saleor_rustify_db::catalog::fallback_channel_slug();
             let pid: i32 = id.parse().unwrap_or(-1);
-            match catalog::get_product(db, channel, pid).await {
+            match catalog::get_product(db, &channel, pid).await {
                 Ok(Some(p)) => {
                     return Ok(Response::new(GetProductResponse {
                         product: Some(p.to_proto()),
@@ -80,10 +82,10 @@ impl ProductService for ProductServiceImpl {
     ) -> Result<Response<ListProductsResponse>, Status> {
         let req = request.into_inner();
         if let Some(db) = &self.db {
-            let channel = if req.channel.is_empty() {
-                "default-channel"
+            let channel = if req.channel.trim().is_empty() {
+                saleor_rustify_db::catalog::fallback_channel_slug()
             } else {
-                req.channel.as_str()
+                req.channel.clone()
             };
             let first = if req.first <= 0 { 100 } else { (req.first as u64).min(1000) };
             let cat = if req.category_id.is_empty() {
@@ -91,7 +93,7 @@ impl ProductService for ProductServiceImpl {
             } else {
                 req.category_id.parse::<i32>().ok()
             };
-            match catalog::list_products(db, channel, cat, first).await {
+            match catalog::list_products(db, &channel, cat, first).await {
                 Ok(products) => {
                     return Ok(Response::new(ListProductsResponse {
                         products: products.iter().map(Product::to_proto).collect(),
@@ -225,9 +227,9 @@ impl ProductService for ProductServiceImpl {
             return err_response("postgres unavailable in offline mode");
         };
         let req = request.into_inner();
-        let channel = if req.channel.is_empty() { "default-channel" } else { req.channel.as_str() };
+        let channel = if req.channel.trim().is_empty() { saleor_rustify_db::catalog::fallback_channel_slug() } else { req.channel.clone() };
         let id: i32 = req.id.parse().unwrap_or(-1);
-        match relations::get_collection(db, channel, id)
+        match relations::get_collection(db, &channel, id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
         {
@@ -250,8 +252,8 @@ impl ProductService for ProductServiceImpl {
             return Ok(Response::new(ListCollectionsResponse { collections: vec![] }));
         };
         let req = request.into_inner();
-        let channel = if req.channel.is_empty() { "default-channel" } else { req.channel.as_str() };
-        let cols = relations::list_collections(db, channel)
+        let channel = if req.channel.trim().is_empty() { saleor_rustify_db::catalog::fallback_channel_slug() } else { req.channel.clone() };
+        let cols = relations::list_collections(db, &channel)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(ListCollectionsResponse {

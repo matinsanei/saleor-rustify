@@ -77,8 +77,8 @@ impl CheckoutService for CheckoutServiceImpl {
         request: Request<CreateCheckoutRequest>,
     ) -> Result<Response<CreateCheckoutResponse>, Status> {
         let req = request.into_inner();
-        let channel = if req.channel.is_empty() {
-            "default-channel".to_string()
+        let channel = if req.channel.trim().is_empty() {
+            saleor_rustify_db::catalog::fallback_channel_slug()
         } else {
             req.channel
         };
@@ -133,7 +133,10 @@ impl CheckoutService for CheckoutServiceImpl {
                 .map_err(|e| Status::internal(e.to_string()))?
             {
                 Some((co, lines)) => {
-                    let ch_slug = channel_slug_for(&co.channel_id);
+                    // Resolve the real channel — never a hardcoded id map.
+                    let ch_slug = saleor_rustify_db::catalog::channel_slug_for_id(db, co.channel_id)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
                     let proto = checkout_proto(&co, &lines, &ch_slug);
                     return Ok(Response::new(GetCheckoutResponse {
                         checkout: Some(proto),
@@ -176,7 +179,9 @@ impl CheckoutService for CheckoutServiceImpl {
             else {
                 return Ok(Response::new(not_found_checkout()));
             };
-            let ch_slug = channel_slug_for(&co.channel_id);
+            let ch_slug = saleor_rustify_db::catalog::channel_slug_for_id(db, co.channel_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
             let ids: Vec<i32> = req
                 .lines
                 .iter()
@@ -311,9 +316,21 @@ impl CheckoutService for CheckoutServiceImpl {
             }));
         };
         use sea_orm::TransactionTrait;
-        // Validate + write discount rows + refresh totals atomically.
+        // Validate + write discount rows + refresh totals atomically, on the
+        // checkout's own channel — never a hardcoded slug.
         let txn = db.begin().await.map_err(|e| Status::internal(e.to_string()))?;
-        let applied = saleor_rustify_db::promotions::apply_voucher(&txn, token, &req.code, "default-channel")
+        let ch_slug = saleor_rustify_db::catalog::channel_slug_for_id(&txn, {
+            use sea_orm::EntityTrait;
+            saleor_rustify_db::entities::checkout_checkout::Entity::find_by_id(token)
+                .one(&txn)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("checkout not found"))?
+                .channel_id
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let applied = saleor_rustify_db::promotions::apply_voucher(&txn, token, &req.code, &ch_slug)
             .await
             .map_err(|e| Status::internal(e.to_string()));
         let applied = match applied {
@@ -340,7 +357,10 @@ impl CheckoutService for CheckoutServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::internal("checkout vanished mid-request"))?;
-        let proto = checkout_proto(&co, &lines, "default-channel");
+        let ch_slug = saleor_rustify_db::catalog::channel_slug_for_id(db, co.channel_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let proto = checkout_proto(&co, &lines, &ch_slug);
         Ok(Response::new(ApplyVoucherResponse {
             checkout: Some(proto),
             voucher_type: applied.voucher_type,
@@ -504,11 +524,3 @@ impl CheckoutService for CheckoutServiceImpl {
     }
 }
 
-/// v1 channel mapping: ids 1/2 are the populatedb channels.
-/// (Full channel-slug round-trip lands with the channel-cache milestone.)
-fn channel_slug_for(channel_id: &i32) -> String {
-    match channel_id {
-        2 => "channel-pln".to_string(),
-        _ => "default-channel".to_string(),
-    }
-}

@@ -21,8 +21,8 @@ use sea_orm::{
 
 use crate::{
     entities::{
-        csv_exportevent, csv_exportfile, discount_voucher, discount_vouchercode,
-        giftcard_giftcard, giftcard_giftcard_tags, giftcard_giftcardtag, product_product,
+        csv_exportevent, csv_exportfile, discount_voucher, discount_vouchercode, giftcard_giftcard,
+        giftcard_giftcard_tags, giftcard_giftcardtag, product_product,
     },
     DbError, Result,
 };
@@ -39,7 +39,8 @@ fn fail(msg: impl Into<String>) -> DbError {
 }
 
 fn export_dir() -> std::path::PathBuf {
-    let base = std::env::var("SALEOR_MEDIA_DIR").unwrap_or_else(|_| "../saleor/saleor-core/media".to_string());
+    let base = std::env::var("SALEOR_MEDIA_DIR")
+        .unwrap_or_else(|_| "../saleor/saleor-core/media".to_string());
     std::path::Path::new(&base).join("exports")
 }
 
@@ -70,7 +71,9 @@ fn escape(s: &str) -> String {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Minimal XLSX workbook (inline strings, no shared-strings table or styles
@@ -118,22 +121,30 @@ fn write_xlsx(name: &str, header: &[&str], rows: &[Vec<String>]) -> Result<Strin
     let path = dir.join(&fname);
     let file = std::fs::File::create(&path).map_err(|e| fail(e.to_string()))?;
     let mut zip = zip::ZipWriter::new(file);
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let opts: zip::write::FileOptions<'_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     use std::io::Write;
     for (pname, content) in parts {
-        zip.start_file(*pname, opts).map_err(|e| fail(e.to_string()))?;
-        zip.write_all(content.as_bytes()).map_err(|e| fail(e.to_string()))?;
+        zip.start_file(*pname, opts)
+            .map_err(|e| fail(e.to_string()))?;
+        zip.write_all(content.as_bytes())
+            .map_err(|e| fail(e.to_string()))?;
     }
     zip.start_file("xl/worksheets/sheet1.xml", opts)
         .map_err(|e| fail(e.to_string()))?;
-    zip.write_all(sheet.as_bytes()).map_err(|e| fail(e.to_string()))?;
+    zip.write_all(sheet.as_bytes())
+        .map_err(|e| fail(e.to_string()))?;
     zip.finish().map_err(|e| fail(e.to_string()))?;
     Ok(format!("exports/{fname}"))
 }
 
 /// Write the table in the requested format; returns the media-relative path.
-fn write_table(name: &str, header: &[&str], rows: &[Vec<String>], format: ExportFormat) -> Result<String> {
+fn write_table(
+    name: &str,
+    header: &[&str],
+    rows: &[Vec<String>],
+    format: ExportFormat,
+) -> Result<String> {
     match format {
         ExportFormat::Csv => write_csv(name, header, rows),
         ExportFormat::Xlsx => write_xlsx(name, header, rows),
@@ -167,8 +178,12 @@ async fn record_event(
     Ok(())
 }
 
-/// Open an export job row (status pending) + started event.
+/// Open an export job row (status pending) + started event, atomically: the
+/// file row and its first event commit together so the prune beat can never
+/// observe a half-opened (eventless) job and delete it mid-export.
 pub async fn open_job(db: &sea_orm::DatabaseConnection, user_id: Option<i32>) -> Result<i32> {
+    use sea_orm::TransactionTrait;
+    let txn = db.begin().await?;
     let t = Utc::now();
     let row = csv_exportfile::ActiveModel {
         status: Set("pending".to_string()),
@@ -180,13 +195,19 @@ pub async fn open_job(db: &sea_orm::DatabaseConnection, user_id: Option<i32>) ->
         message: Set(None),
         ..Default::default()
     }
-    .insert(db)
+    .insert(&txn)
     .await?;
-    record_event(db, row.id, events::STARTED, user_id).await?;
+    record_event(&txn, row.id, events::STARTED, user_id).await?;
+    txn.commit().await?;
     Ok(row.id)
 }
 
-async fn finish_job(db: &sea_orm::DatabaseConnection, id: i32, path: &str, user_id: Option<i32>) -> Result<()> {
+async fn finish_job(
+    db: &sea_orm::DatabaseConnection,
+    id: i32,
+    path: &str,
+    user_id: Option<i32>,
+) -> Result<()> {
     if let Some(row) = csv_exportfile::Entity::find_by_id(id).one(db).await? {
         let mut am: csv_exportfile::ActiveModel = row.into();
         am.status = Set("success".to_string());
@@ -222,8 +243,7 @@ pub async fn export_gift_cards(
         Err(e) => return Err(e),
     };
     let out: Result<i32> = async {
-        let mut q = giftcard_giftcard::Entity::find()
-            .order_by_asc(giftcard_giftcard::Column::Id);
+        let mut q = giftcard_giftcard::Entity::find().order_by_asc(giftcard_giftcard::Column::Id);
         if let Some(list) = ids {
             q = q.filter(giftcard_giftcard::Column::Id.is_in(list));
         }
@@ -243,7 +263,15 @@ pub async fn export_gift_cards(
         }
         let path = write_table(
             "gift-cards",
-            &["code", "initial_balance", "current_balance", "currency", "is_active", "expiry_date", "tags"],
+            &[
+                "code",
+                "initial_balance",
+                "current_balance",
+                "currency",
+                "is_active",
+                "expiry_date",
+                "tags",
+            ],
             &rows,
             format,
         )?;
@@ -287,8 +315,8 @@ pub async fn export_voucher_codes(
 ) -> Result<i32> {
     let job = open_job(db, user_id).await?;
     let out: Result<i32> = async {
-        let mut q = discount_vouchercode::Entity::find()
-            .order_by_asc(discount_vouchercode::Column::Code);
+        let mut q =
+            discount_vouchercode::Entity::find().order_by_asc(discount_vouchercode::Column::Code);
         if let Some(vid) = voucher_id {
             q = q.filter(discount_vouchercode::Column::VoucherId.eq(vid));
         }
@@ -312,7 +340,12 @@ pub async fn export_voucher_codes(
                 c.is_active.to_string(),
             ]);
         }
-        let path = write_table("voucher-codes", &["code", "voucher", "used", "is_active"], &rows, format)?;
+        let path = write_table(
+            "voucher-codes",
+            &["code", "voucher", "used", "is_active"],
+            &rows,
+            format,
+        )?;
         finish_job(db, job, &path, user_id).await?;
         Ok(job)
     }
@@ -348,7 +381,12 @@ pub async fn export_products(
             .into_iter()
             .map(|(id, name, slug, created)| vec![id.to_string(), name, slug, created.to_rfc3339()])
             .collect();
-        let path = write_table("products", &["id", "name", "slug", "created_at"], &out, format)?;
+        let path = write_table(
+            "products",
+            &["id", "name", "slug", "created_at"],
+            &out,
+            format,
+        )?;
         finish_job(db, job, &path, user_id).await?;
         Ok(job)
     }
@@ -367,7 +405,12 @@ fn retention_cutoff() -> chrono::DateTime<Utc> {
         if let Ok(n) = s.parse::<i64>() {
             return Some(n);
         }
-        let (n, rest) = (s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>(), s.trim_start_matches(|c: char| c.is_ascii_digit()).trim());
+        let (n, rest) = (
+            s.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>(),
+            s.trim_start_matches(|c: char| c.is_ascii_digit()).trim(),
+        );
         let n: i64 = n.parse().ok()?;
         let mult = if rest.starts_with("day") {
             86_400
@@ -426,14 +469,30 @@ pub async fn prune_old_export_files(db: &sea_orm::DatabaseConnection) -> Result<
     let base = export_dir();
     // export_dir() already ends in "exports/"; content_file is stored as
     // "exports/<fname>" relative to the media root.
-    let media_base = base.parent().map(|p| p.to_path_buf()).unwrap_or(base.clone());
+    let media_base = base
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or(base.clone());
     let mut removed = 0usize;
     for (id, content) in files {
         if with_events.contains(&id) && !old_set.contains(&id) {
             continue;
         }
-        if let Some(rel) = content.filter(|s| !s.trim().is_empty()) {
-            let _ = std::fs::remove_file(media_base.join(&rel));
+        if let Some(rel) = content
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            // content_file is DB-sourced: fence it into the media root
+            // (refuse absolute paths and `..`; lexical check, target may
+            // already be gone). Rows are still deleted either way.
+            let p = std::path::Path::new(&rel);
+            if !p.is_absolute()
+                && !p
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                let _ = std::fs::remove_file(media_base.join(p));
+            }
         }
         csv_exportevent::Entity::delete_many()
             .filter(csv_exportevent::Column::ExportFileId.eq(id))

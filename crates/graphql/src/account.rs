@@ -1212,7 +1212,13 @@ impl AccountMutation {
                     errors: vec![],
                 })
             }
-            Err(e) => Ok(err(e.to_string())),
+            // Django returns UNIQUE on duplicate email (customer_create.py);
+            // the custom API keys its already-exists recovery off this code.
+            Err(e) => {
+                let msg = e.to_string();
+                let code = if msg.contains("already exists") { "UNIQUE" } else { "INVALID" };
+                Ok(gen::CustomerCreate { user: None, errors: vec![aerr(code, None, msg)] })
+            }
         }
     }
 
@@ -1415,7 +1421,7 @@ impl AccountMutation {
         if user.is_confirmed {
             return Ok(err("account is already confirmed".into()));
         }
-        let token = saleor_rustify_db::account_writes::issue_token(db, "confirm", uid, 24 * 7, "")
+        let token = saleor_rustify_db::account_writes::issue_token(db, "confirm", uid, 24 * 7, &user.email)
             .await.map_err(|e| Error::new(e.to_string()))?;
         tracing::info!("account-confirm token for {}: {}", user.email, token);
         if let Err(e) = crate::mail::send_confirmation(&user.email, &redirect_url, &token).await {
@@ -1853,7 +1859,7 @@ impl AccountMutation {
         if let Err(e) = saleor_rustify_db::account_writes::set_password(db, uid, &input.password).await {
             return Ok(err(e.to_string()));
         }
-        let token = saleor_rustify_db::account_writes::issue_token(db, "confirm", uid, 24 * 7, "").await.map_err(|e| Error::new(e.to_string()))?;
+        let token = saleor_rustify_db::account_writes::issue_token(db, "confirm", uid, 24 * 7, &nu.email).await.map_err(|e| Error::new(e.to_string()))?;
         tracing::info!("account-confirm token for {}: {}", nu.email, token);
         Ok(GqlAccountRegister {
             user: Some(assemble_user(db, uid, &uid.to_string()).await.map_err(Error::new)?),
@@ -1861,13 +1867,29 @@ impl AccountMutation {
         })
     }
 
-    async fn confirm_account(&self, ctx: &Context<'_>, token: String) -> Result<GqlConfirmResult> {
+    async fn confirm_account(&self, ctx: &Context<'_>, token: String, email: Option<String>) -> Result<GqlConfirmResult> {
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
         let err = |m: String| GqlConfirmResult { user: None, errors: vec![aerr("INVALID", None, m)] };
-        let (uid, _) = match saleor_rustify_db::account_writes::consume_token(db, "confirm", &token).await {
+        let (uid, payload) = match saleor_rustify_db::account_writes::consume_token(db, "confirm", &token).await {
             Ok(v) => v,
             Err(e) => return Ok(err(e.to_string())),
         };
+        // Saleor binds the confirmation to the account email: when the
+        // caller passes `email`, it must match the token payload (new
+        // tokens) or the account email (legacy empty-payload tokens).
+        if let Some(given) = email.as_ref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()) {
+            let bound = if payload.trim().is_empty() {
+                use sea_orm::EntityTrait;
+                saleor_rustify_db::entities::account_user::Entity::find_by_id(uid)
+                    .one(db).await.map_err(|e| Error::new(e.to_string()))?
+                    .map(|u| u.email.to_lowercase())
+            } else {
+                Some(payload.trim().to_lowercase())
+            };
+            if bound.as_deref() != Some(given.as_str()) {
+                return Ok(err("invalid confirmation token for this email".into()));
+            }
+        }
         if let Err(e) = saleor_rustify_db::account_writes::confirm_user(db, uid).await {
             return Ok(err(e.to_string()));
         }

@@ -87,11 +87,13 @@ fn db_err(e: saleor_rustify_db::DbError) -> saleor_rustify_proto::common::Error 
     DraftOrderServiceImpl::err(code, e.to_string())
 }
 
-fn channel_of(req: &str) -> &str {
-    if req.is_empty() {
-        "default-channel"
+/// Request channel with the centralized deployment fallback (never a
+/// hardcoded slug; see `catalog::fallback_channel_slug`).
+fn req_channel(req: &str) -> String {
+    if req.trim().is_empty() {
+        saleor_rustify_db::catalog::fallback_channel_slug()
     } else {
-        req
+        req.to_string()
     }
 }
 
@@ -104,7 +106,7 @@ impl DraftOrderService for DraftOrderServiceImpl {
         let db = self.db()?;
         crate::access::authorize(db, req.metadata(), crate::access::MANAGE_ORDERS).await?;
         let r = req.into_inner();
-        match drafts::create_draft(db, channel_of(&r.channel), &r.email, None, Self::lines(r.lines)?, None).await
+        match drafts::create_draft(db, &req_channel(&r.channel), &r.email, None, Self::lines(r.lines)?, None).await
         {
             Ok(v) => Ok(Response::new(CreateDraftOrderResponse {
                 order: Some(Self::info(&v)),
@@ -125,7 +127,7 @@ impl DraftOrderService for DraftOrderServiceImpl {
         crate::access::authorize(db, req.metadata(), crate::access::MANAGE_ORDERS).await?;
         let r = req.into_inner();
         let id = Self::id(&r.order_id, "order_id")?;
-        match drafts::add_lines(db, id, channel_of(&r.channel), Self::lines(r.lines)?, None).await {
+        match drafts::add_lines(db, id, &req_channel(&r.channel), Self::lines(r.lines)?, None).await {
             Ok(v) => Ok(Response::new(DraftOrderLinesResponse {
                 order: Some(Self::info(&v)),
                 errors: vec![],

@@ -9,25 +9,21 @@
 //!   "promotion"`, one per line) carry the whole-line amount
 //!   (`_get_rule_discount_amount` = per-unit saving × quantity);
 //! - vouchers: `entire_order` and `specific_product` write rows;
-//!   `shipping` vouchers need a shipping price (not modeled in v1) and
-//!   return a clean NOT_APPLICABLE instead of a wrong number.
+//!   `shipping` vouchers require a selected delivery method
+//!   (VOUCHER_NOT_APPLICABLE otherwise) and reduce the shipping leg.
 
 use chrono::Utc;
 use rust_decimal::Decimal;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter,
-    QuerySelect, Set,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, Set};
 use uuid::Uuid;
 
 use crate::{
     catalog::channel_info,
     entities::{
-        checkout_checkout, discount_checkoutdiscount,
-        discount_checkoutlinediscount, discount_promotion, discount_promotionrule,
-        discount_promotionrule_channels, discount_promotionrule_variants, discount_voucher,
-        discount_vouchercode, discount_voucherchannellisting, product_collectionproduct,
-        product_product,
+        checkout_checkout, discount_checkoutdiscount, discount_checkoutlinediscount,
+        discount_promotion, discount_promotionrule, discount_promotionrule_channels,
+        discount_promotionrule_variants, discount_voucher, discount_voucherchannellisting,
+        discount_vouchercode, product_collectionproduct, product_product,
     },
     DbError, Result,
 };
@@ -124,7 +120,11 @@ async fn variant_context(
         .into_tuple::<i32>()
         .all(db)
         .await?;
-    Ok(VariantContext { product_id, category_id, collection_ids })
+    Ok(VariantContext {
+        product_id,
+        category_id,
+        collection_ids,
+    })
 }
 
 async fn rule_matches_variant(
@@ -330,7 +330,9 @@ pub async fn apply_voucher(
         .await?
         .ok_or_else(|| DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(code.into())))?;
     if !code_row.is_active {
-        return Err(DbError::SeaOrm(sea_orm::DbErr::Custom("voucher code inactive".into())));
+        return Err(DbError::SeaOrm(sea_orm::DbErr::Custom(
+            "voucher code inactive".into(),
+        )));
     }
     let v = discount_voucher::Entity::find_by_id(code_row.voucher_id)
         .one(db)
@@ -338,11 +340,15 @@ pub async fn apply_voucher(
         .ok_or_else(|| DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(code.into())))?;
     let now: sea_orm::prelude::DateTimeWithTimeZone = Utc::now().into();
     if v.start_date > now {
-        return Err(DbError::SeaOrm(sea_orm::DbErr::Custom("voucher not started".into())));
+        return Err(DbError::SeaOrm(sea_orm::DbErr::Custom(
+            "voucher not started".into(),
+        )));
     }
     if let Some(end) = v.end_date {
         if end < now {
-            return Err(DbError::SeaOrm(sea_orm::DbErr::Custom("voucher expired".into())));
+            return Err(DbError::SeaOrm(sea_orm::DbErr::Custom(
+                "voucher expired".into(),
+            )));
         }
     }
     if let Some(limit) = v.usage_limit {
@@ -358,7 +364,9 @@ pub async fn apply_voucher(
         .one(db)
         .await?
         .ok_or_else(|| {
-            DbError::SeaOrm(sea_orm::DbErr::Custom("voucher not available on channel".into()))
+            DbError::SeaOrm(sea_orm::DbErr::Custom(
+                "voucher not available on channel".into(),
+            ))
         })?;
 
     // Checkout row must exist.
@@ -368,9 +376,69 @@ pub async fn apply_voucher(
         .ok_or_else(|| DbError::CheckoutNotFound(checkout_token.to_string()))?;
 
     match v.r#type.as_str() {
-        "shipping" => Err(DbError::SeaOrm(sea_orm::DbErr::Custom(
-            "NOT_APPLICABLE: shipping vouchers need a shipping price (v1 has none)".into(),
-        ))),
+        "shipping" => {
+            // Django: a SHIPPING voucher needs a selected delivery method
+            // (VOUCHER_NOT_APPLICABLE otherwise — this is why callers pick
+            // the method before applying the code). The discount applies to
+            // the method's channel-listing price: fixed is capped at it,
+            // percentage takes that share of it. A zero-price (symbolic)
+            // method applies cleanly with a zero discount.
+            let mid = co.shipping_method_id.ok_or_else(|| {
+                DbError::SeaOrm(sea_orm::DbErr::Custom(
+                    "VOUCHER_NOT_APPLICABLE: shipping voucher needs a delivery method".into(),
+                ))
+            })?;
+            let ship: Decimal = crate::checkout_store::shipping_method_price(db, mid, ch_id)
+                .await?
+                .unwrap_or(Decimal::ZERO);
+            // Fixed is capped at the shipping price; percentage takes that
+            // share of it (Django applies the voucher to the shipping leg).
+            let discount = match v.discount_value_type.as_str() {
+                "fixed" => listing.discount_value.min(ship),
+                "percentage" => {
+                    let after = saleor_rustify_core::discount::apply_percentage(
+                        ship,
+                        listing.discount_value,
+                        &listing.currency,
+                    );
+                    (ship - after).max(Decimal::ZERO)
+                }
+                _ => Decimal::ZERO,
+            };
+            let mut co_am: checkout_checkout::ActiveModel = co.into();
+            co_am.voucher_code = Set(Some(code.to_string()));
+            co_am.update(db).await?;
+            // One voucher discount per checkout (replace on re-apply → idempotent).
+            discount_checkoutdiscount::Entity::delete_many()
+                .filter(discount_checkoutdiscount::Column::CheckoutId.eq(checkout_token))
+                .filter(discount_checkoutdiscount::Column::Type.eq("voucher"))
+                .exec(db)
+                .await?;
+            discount_checkoutdiscount::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                created_at: Set(Utc::now().into()),
+                r#type: Set("voucher".to_string()),
+                value_type: Set(v.discount_value_type.clone()),
+                value: Set(listing.discount_value),
+                amount_value: Set(discount),
+                currency: Set(listing.currency.clone()),
+                voucher_code: Set(Some(code.to_string())),
+                checkout_id: Set(Some(checkout_token)),
+                voucher_id: Set(Some(v.id)),
+                ..Default::default()
+            }
+            .insert(db)
+            .await?;
+            Ok(VoucherApplication {
+                voucher_id: v.id,
+                code: code.to_string(),
+                voucher_type: v.r#type,
+                value_type: v.discount_value_type,
+                value: listing.discount_value,
+                currency: listing.currency,
+                amount: discount,
+            })
+        }
         "entire_order" => {
             // Django: CheckoutDiscount row (order-level) + voucher_code on checkout.
             let base: Decimal = co.total_gross_amount;
@@ -463,21 +531,26 @@ pub async fn apply_voucher(
                 // Product-scope check when voucher lists products.
                 if !prod_ids.is_empty() {
                     use crate::entities::product_productvariant;
-                    let pid: Option<i32> = product_productvariant::Entity::find_by_id(line.variant_id)
-                        .select_only()
-                        .column(product_productvariant::Column::ProductId)
-                        .into_tuple::<i32>()
-                        .one(db)
-                        .await?;
+                    let pid: Option<i32> =
+                        product_productvariant::Entity::find_by_id(line.variant_id)
+                            .select_only()
+                            .column(product_productvariant::Column::ProductId)
+                            .into_tuple::<i32>()
+                            .one(db)
+                            .await?;
                     if pid.map(|p| !prod_ids.contains(&p)).unwrap_or(true)
                         && !var_ids.contains(&line.variant_id)
                     {
                         continue;
                     }
                 }
-                let unit = line.price_override.unwrap_or(line.undiscounted_unit_price_amount);
+                let unit = line
+                    .price_override
+                    .unwrap_or(line.undiscounted_unit_price_amount);
                 let discounted = match v.discount_value_type.as_str() {
-                    "fixed" => saleor_rustify_core::discount::apply_fixed(unit, listing.discount_value),
+                    "fixed" => {
+                        saleor_rustify_core::discount::apply_fixed(unit, listing.discount_value)
+                    }
                     "percentage" => saleor_rustify_core::discount::apply_percentage(
                         unit,
                         listing.discount_value,
@@ -485,7 +558,8 @@ pub async fn apply_voucher(
                     ),
                     _ => unit,
                 };
-                let amount = ((unit - discounted).max(Decimal::ZERO)) * Decimal::from(line.quantity);
+                let amount =
+                    ((unit - discounted).max(Decimal::ZERO)) * Decimal::from(line.quantity);
                 if amount > Decimal::ZERO {
                     matched += 1;
                     total += amount;
@@ -517,11 +591,12 @@ pub async fn apply_voucher(
                     "voucher not applicable to any line".into(),
                 )));
             }
-            let mut co_am: checkout_checkout::ActiveModel = checkout_checkout::Entity::find_by_id(checkout_token)
-                .one(db)
-                .await?
-                .ok_or_else(|| DbError::CheckoutNotFound(checkout_token.to_string()))?
-                .into();
+            let mut co_am: checkout_checkout::ActiveModel =
+                checkout_checkout::Entity::find_by_id(checkout_token)
+                    .one(db)
+                    .await?
+                    .ok_or_else(|| DbError::CheckoutNotFound(checkout_token.to_string()))?
+                    .into();
             co_am.voucher_code = Set(Some(code.to_string()));
             co_am.update(db).await?;
             Ok(VoucherApplication {
@@ -545,15 +620,66 @@ pub async fn checkout_voucher_total(
     db: &impl sea_orm::ConnectionTrait,
     checkout_token: Uuid,
 ) -> Result<Decimal> {
-    // Scoped to voucher rows: ORDER_PROMOTION discounts live in the same
-    // table (T3) and have their own totals term — unfiltered sums would
-    // double-count them here.
+    // Scoped to non-shipping voucher rows: ORDER_PROMOTION discounts live
+    // in the same table (T3) and have their own totals term, and
+    // shipping-type vouchers reduce the shipping leg (see
+    // `shipping_voucher_total`) — unfiltered sums would double-count.
+    Ok(voucher_rows_by_kind(db, checkout_token, false)
+        .await?
+        .iter()
+        .map(|r| r.amount_value)
+        .sum())
+}
+
+/// Shipping-leg voucher total: only rows whose voucher is
+/// type = `shipping`. Subtracted from the method price in `refresh_totals`.
+pub async fn shipping_voucher_total(
+    db: &impl sea_orm::ConnectionTrait,
+    checkout_token: Uuid,
+) -> Result<Decimal> {
+    Ok(voucher_rows_by_kind(db, checkout_token, true)
+        .await?
+        .iter()
+        .map(|r| r.amount_value)
+        .sum())
+}
+
+async fn voucher_rows_by_kind(
+    db: &impl sea_orm::ConnectionTrait,
+    checkout_token: Uuid,
+    shipping: bool,
+) -> Result<Vec<crate::entities::discount_checkoutdiscount::Model>> {
+    use crate::entities::{discount_checkoutdiscount, discount_voucher};
     let rows = discount_checkoutdiscount::Entity::find()
         .filter(discount_checkoutdiscount::Column::CheckoutId.eq(checkout_token))
         .filter(discount_checkoutdiscount::Column::Type.eq("voucher"))
         .all(db)
         .await?;
-    Ok(rows.iter().map(|r| r.amount_value).sum())
+    if rows.is_empty() {
+        return Ok(rows);
+    }
+    let vids: Vec<i32> = rows.iter().filter_map(|r| r.voucher_id).collect();
+    let ship_ids: std::collections::HashSet<i32> = if vids.is_empty() {
+        Default::default()
+    } else {
+        discount_voucher::Entity::find()
+            .select_only()
+            .column(discount_voucher::Column::Id)
+            .filter(discount_voucher::Column::Id.is_in(vids))
+            .filter(discount_voucher::Column::Type.eq("shipping"))
+            .into_tuple::<i32>()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect()
+    };
+    Ok(rows
+        .into_iter()
+        .filter(|r| {
+            let is_ship = r.voucher_id.map(|v| ship_ids.contains(&v)).unwrap_or(false);
+            is_ship == shipping
+        })
+        .collect())
 }
 
 /// Line-level voucher total (specific_product discounts).
@@ -588,7 +714,6 @@ pub async fn increase_usage(
     code: &str,
     customer_email: Option<&str>,
 ) -> Result<()> {
-    
     let Some(code_row) = discount_vouchercode::Entity::find()
         .filter(discount_vouchercode::Column::Code.eq(code))
         .one(db)

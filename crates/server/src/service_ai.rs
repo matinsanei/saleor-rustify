@@ -36,11 +36,13 @@ svc!(SemanticSearchImpl);
 svc!(RecommenderImpl);
 svc!(ChatAgentImpl);
 
-fn channel_of(req: &str) -> &str {
-    if req.is_empty() {
-        "default-channel"
+/// Request channel with the centralized deployment fallback (never a
+/// hardcoded slug; see `catalog::fallback_channel_slug`).
+fn req_channel(req: &str) -> String {
+    if req.trim().is_empty() {
+        saleor_rustify_db::catalog::fallback_channel_slug()
     } else {
-        req
+        req.to_string()
     }
 }
 
@@ -70,7 +72,7 @@ impl SemanticSearch for SemanticSearchImpl {
     ) -> Result<Response<SearchProductsResponse>, Status> {
         let req = request.into_inner();
         let db = self.db()?;
-        let channel = channel_of(&req.channel).to_string();
+        let channel = req_channel(&req.channel);
         let (ch_id, currency) = catalog::channel_info(db, &channel)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -103,7 +105,7 @@ impl Recommender for RecommenderImpl {
     ) -> Result<Response<RecommendProductsResponse>, Status> {
         let req = request.into_inner();
         let db = self.db()?;
-        let channel = channel_of(&req.channel).to_string();
+        let channel = req_channel(&req.channel);
         let vid: i32 = req.variant_id.parse().unwrap_or(-1);
         let first = if req.first <= 0 { 10 } else { (req.first as u64).min(1000) };
         let recos = recommend::recommend_v2(db, vid, &channel, first)
@@ -137,7 +139,7 @@ impl ChatAgent for ChatAgentImpl {
     ) -> Result<Response<Self::ChatStream>, Status> {
         let req = request.into_inner();
         let db = self.db()?.clone();
-        let channel = channel_of(&req.channel).to_string();
+        let channel = req_channel(&req.channel);
         let message = req.message.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {

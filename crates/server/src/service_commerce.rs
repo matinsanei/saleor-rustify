@@ -142,8 +142,10 @@ svc!(ChannelServiceImpl);
 svc!(TaxServiceImpl);
 svc!(WarehouseServiceImpl);
 
-fn channel_of(req: &str) -> &str {
-    if req.is_empty() { "default-channel" } else { req }
+/// Request channel with the centralized deployment fallback (never a
+/// hardcoded slug; see `catalog::fallback_channel_slug`).
+fn req_channel(req: &str) -> String {
+    if req.trim().is_empty() { saleor_rustify_db::catalog::fallback_channel_slug() } else { req.to_string() }
 }
 
 #[tonic::async_trait]
@@ -153,7 +155,7 @@ impl DiscountService for DiscountServiceImpl {
         request: Request<ValidateVoucherRequest>,
     ) -> Result<Response<ValidateVoucherResponse>, Status> {
         let req = request.into_inner();
-        match commerce::validate_voucher(self.db()?, &req.code, channel_of(&req.channel)).await {
+        match commerce::validate_voucher(self.db()?, &req.code, &req_channel(&req.channel)).await {
             Ok(v) => Ok(Response::new(ValidateVoucherResponse {
                 voucher: Some(VoucherInfo {
                     code: v.code,
@@ -179,7 +181,7 @@ impl DiscountService for DiscountServiceImpl {
         request: Request<ListPromotionsRequest>,
     ) -> Result<Response<ListPromotionsResponse>, Status> {
         let req = request.into_inner();
-        let promos = commerce::list_promotions(self.db()?, channel_of(&req.channel))
+        let promos = commerce::list_promotions(self.db()?, &req_channel(&req.channel))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(ListPromotionsResponse {
@@ -213,7 +215,7 @@ impl ShippingService for ShippingServiceImpl {
         request: Request<ListShippingMethodsRequest>,
     ) -> Result<Response<ListShippingMethodsResponse>, Status> {
         let req = request.into_inner();
-        let methods = commerce::list_shipping_methods(self.db()?, channel_of(&req.channel))
+        let methods = commerce::list_shipping_methods(self.db()?, &req_channel(&req.channel))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(ListShippingMethodsResponse {
@@ -603,7 +605,7 @@ impl ChannelService for ChannelServiceImpl {
         crate::access::authorize(db, request.metadata(), crate::access::MANAGE_CHANNELS).await?;
         let r = request.into_inner();
         let pid: i32 = r.product_id.parse().map_err(|_| Status::invalid_argument("product_id must be an integer"))?;
-        let channel = channel_of(&r.channel).to_string();
+        let channel = req_channel(&r.channel);
         match saleor_rustify_db::channels::set_product_listing(
             db,
             &channel,
@@ -638,7 +640,7 @@ impl ChannelService for ChannelServiceImpl {
         } else {
             Some(r.cost_price.parse::<rust_decimal::Decimal>().map_err(|_| Status::invalid_argument("cost_price must be a decimal string"))?)
         };
-        let channel = channel_of(&r.channel).to_string();
+        let channel = req_channel(&r.channel);
         match saleor_rustify_db::channels::set_variant_price(db, &channel, vid, price, cost).await {
             Ok(()) => Ok(Response::new(SetVariantPriceResponse { errors: vec![] })),
             Err(e) => Ok(Response::new(SetVariantPriceResponse {
@@ -674,8 +676,8 @@ impl TaxService for TaxServiceImpl {
     ) -> Result<Response<GetTaxRateResponse>, Status> {
         let db = self.db()?;
         let r = request.into_inner();
-        let channel = channel_of(&r.channel);
-        let cfg = saleor_rustify_db::taxes::channel_config(db, channel)
+        let channel = req_channel(&r.channel);
+        let cfg = saleor_rustify_db::taxes::channel_config(db, &channel)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let class = if r.variant_id.is_empty() {
@@ -704,7 +706,7 @@ impl TaxService for TaxServiceImpl {
     ) -> Result<Response<CalculateTaxesResponse>, Status> {
         let db = self.db()?;
         let r = request.into_inner();
-        let channel = channel_of(&r.channel).to_string();
+        let channel = req_channel(&r.channel);
         let mut lines = Vec::with_capacity(r.lines.len());
         for l in &r.lines {
             let vid: i32 = l.variant_id.parse().map_err(|_| Status::invalid_argument("variant_id must be an integer"))?;
@@ -751,7 +753,7 @@ impl WarehouseService for WarehouseServiceImpl {
         request: Request<ListWarehousesRequest>,
     ) -> Result<Response<ListWarehousesResponse>, Status> {
         let req = request.into_inner();
-        let wh = commerce::list_warehouses(self.db()?, channel_of(&req.channel))
+        let wh = commerce::list_warehouses(self.db()?, &req_channel(&req.channel))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(ListWarehousesResponse {

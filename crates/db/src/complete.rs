@@ -79,6 +79,29 @@ async fn existing_order(
     }))
 }
 
+/// Public replay lookup: an order minted from a checkout token, with the
+/// header fields API layers need to answer retries. Django's
+/// `checkoutComplete` returns the already-created order on replay instead
+/// of 404ing (the checkout row itself is gone by then).
+pub async fn find_completed_order(
+    db: &DatabaseConnection,
+    token: Uuid,
+) -> Result<Option<(Uuid, i32, String, rust_decimal::Decimal, String)>> {
+    let row: Option<(Uuid, i32, String, rust_decimal::Decimal, String)> =
+        order_order::Entity::find()
+            .select_only()
+            .column(order_order::Column::Id)
+            .column(order_order::Column::Number)
+            .column(order_order::Column::Status)
+            .column(order_order::Column::TotalGrossAmount)
+            .column(order_order::Column::Currency)
+            .filter(order_order::Column::CheckoutToken.eq(token.to_string()))
+            .into_tuple()
+            .one(db)
+            .await?;
+    Ok(row)
+}
+
 async fn write_order_event(
     txn: &impl ConnectionTrait,
     order_id: Uuid,

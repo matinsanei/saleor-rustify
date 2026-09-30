@@ -32,10 +32,9 @@ async fn created_row_carries_django_defaults() {
     let db = db().await;
     let (ch_id, currency) = catalog::channel_info(&db, "default-channel").await.unwrap();
 
-    let token =
-        checkout_store::create_checkout_row(&db, ch_id, &currency, "buyer@example.com")
-            .await
-            .unwrap();
+    let token = checkout_store::create_checkout_row(&db, ch_id, &currency, "buyer@example.com")
+        .await
+        .unwrap();
 
     let (co, _) = checkout_store::load_checkout(&db, token)
         .await
@@ -48,7 +47,9 @@ async fn created_row_carries_django_defaults() {
     assert_eq!(co.charge_status, "none");
     assert_eq!(co.email.as_deref(), Some("buyer@example.com"));
 
-    checkout_store::delete_checkout_row(&db, token).await.unwrap();
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -81,7 +82,9 @@ async fn lines_persist_and_total_matches_listings() {
     let domain = checkout_store::to_domain(&co, &lines, "default-channel");
     assert_eq!(domain.total().amount, unit * Decimal::from(3));
 
-    checkout_store::delete_checkout_row(&db, token).await.unwrap();
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -95,9 +98,17 @@ async fn price_override_wins_in_domain_total() {
         .await
         .unwrap();
     let override_price = Decimal::new(1222, 2);
-    checkout_store::add_line_row(&db, token, vid, 1, Decimal::new(9999, 2), &currency, Some(override_price))
-        .await
-        .unwrap();
+    checkout_store::add_line_row(
+        &db,
+        token,
+        vid,
+        1,
+        Decimal::new(9999, 2),
+        &currency,
+        Some(override_price),
+    )
+    .await
+    .unwrap();
 
     let (co, lines) = checkout_store::load_checkout(&db, token)
         .await
@@ -107,7 +118,9 @@ async fn price_override_wins_in_domain_total() {
     assert_eq!(domain.lines[0].unit_price.amount, override_price);
     assert_eq!(domain.total().amount, override_price);
 
-    checkout_store::delete_checkout_row(&db, token).await.unwrap();
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -125,7 +138,9 @@ async fn zero_quantity_rejected_like_django_validator() {
             .is_err()
     );
 
-    checkout_store::delete_checkout_row(&db, token).await.unwrap();
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -140,14 +155,14 @@ async fn delete_removes_checkout_and_lines() {
     checkout_store::add_line_row(&db, token, vid, 1, unit, &currency, None)
         .await
         .unwrap();
-    checkout_store::delete_checkout_row(&db, token).await.unwrap();
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
 
-    assert!(
-        checkout_store::load_checkout(&db, token)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(checkout_store::load_checkout(&db, token)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -163,7 +178,12 @@ async fn same_variant_merges_into_one_row() {
     let token = checkout_store::create_checkout_row(&db, ch_id, &currency, "")
         .await
         .unwrap();
-    let item = || NewLine { variant_id: vid, quantity: 1, unit_price: unit, price_override: None };
+    let item = || NewLine {
+        variant_id: vid,
+        quantity: 1,
+        unit_price: unit,
+        price_override: None,
+    };
     checkout_store::add_lines_tx(&db, token, ch_id, &currency, &[item()])
         .await
         .unwrap();
@@ -178,7 +198,9 @@ async fn same_variant_merges_into_one_row() {
     assert_eq!(lines.len(), 1, "same variant must merge into one row");
     assert_eq!(lines[0].quantity, 3);
 
-    checkout_store::delete_checkout_row(&db, token).await.unwrap();
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -197,7 +219,12 @@ async fn denormalized_totals_refresh_for_django_readers() {
         token,
         ch_id,
         &currency,
-        &[NewLine { variant_id: vid, quantity: 2, unit_price: unit, price_override: None }],
+        &[NewLine {
+            variant_id: vid,
+            quantity: 2,
+            unit_price: unit,
+            price_override: None,
+        }],
     )
     .await
     .unwrap();
@@ -212,7 +239,9 @@ async fn denormalized_totals_refresh_for_django_readers() {
     // recalculation does the same subtraction), so we verify:
     //   1. total is non-negative
     //   2. total <= undiscounted line sum (discounts only reduce)
-    //   3. all three denormalized columns agree (net == gross == subtotal)
+    //   3. Django-shaped books: subtotal holds line-level discounts only,
+    //      order-level discounts (vouchers/order promotions) land in total,
+    //      so subtotal >= total; pre-tax net == gross on both legs.
     let lines_gross_sum = unit * Decimal::from(2);
     assert!(
         co.total_gross_amount >= Decimal::ZERO,
@@ -225,9 +254,111 @@ async fn denormalized_totals_refresh_for_django_readers() {
         co.total_gross_amount,
         lines_gross_sum,
     );
-    // Pre-tax invariant: net == gross == subtotal_gross.
-    assert_eq!(co.total_net_amount, co.total_gross_amount, "net must equal gross (pre-tax)");
-    assert_eq!(co.subtotal_gross_amount, co.total_gross_amount, "subtotal_gross must equal total_gross");
+    // Pre-tax invariant: net == gross on each leg; subtotal carries only
+    // line-level discounts, so it sits at or above total.
+    assert_eq!(
+        co.total_net_amount, co.total_gross_amount,
+        "net must equal gross (pre-tax)"
+    );
+    assert_eq!(
+        co.subtotal_net_amount, co.subtotal_gross_amount,
+        "subtotal net must equal gross (pre-tax)"
+    );
+    assert!(
+        co.subtotal_gross_amount >= co.total_gross_amount,
+        "subtotal_gross={} must be >= total_gross={} (order-level discounts live in total)",
+        co.subtotal_gross_amount,
+        co.total_gross_amount,
+    );
 
-    checkout_store::delete_checkout_row(&db, token).await.unwrap();
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn add_lines_rejects_unknown_variant() {
+    // Shared choke point: every writer (GraphQL + gRPC) funnels through
+    // add_lines_tx, so unknown variants fail here with a coded error
+    // instead of becoming zero-priced lines.
+    let db = db().await;
+    let (ch_id, currency) = catalog::channel_info(&db, "default-channel")
+        .await
+        .unwrap();
+    let token = checkout_store::create_checkout_row(&db, ch_id, &currency, "choke@example.com")
+        .await
+        .unwrap();
+
+    let err = checkout_store::add_lines_tx(
+        &db,
+        token,
+        ch_id,
+        &currency,
+        &[checkout_store::NewLine {
+            variant_id: 987_654_321,
+            quantity: 1,
+            unit_price: Decimal::ZERO,
+            price_override: None,
+        }],
+    )
+    .await
+    .expect_err("unknown variant must be rejected");
+    assert!(
+        err.to_string().contains("NOT_FOUND"),
+        "expected NOT_FOUND, got {err}"
+    );
+
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn add_lines_rejects_insufficient_stock() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use saleor_rustify_db::entities::warehouse_stock;
+    let db = db().await;
+    let (ch_id, currency) = catalog::channel_info(&db, "default-channel")
+        .await
+        .unwrap();
+    let (vid, unit) = usd_variant(&db).await;
+    // Current sellable stock for this variant (Django validates against
+    // stock AFTER the per-line limit check, so request one more unit —
+    // unless that trips the limit first, in which case the LIMIT code is
+    // the correct Saleor behavior too).
+    let stock: i32 = warehouse_stock::Entity::find()
+        .filter(warehouse_stock::Column::ProductVariantId.eq(vid))
+        .all(&db)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.quantity - s.quantity_allocated)
+        .sum();
+    let token = checkout_store::create_checkout_row(&db, ch_id, &currency, "choke2@example.com")
+        .await
+        .unwrap();
+
+    let err = checkout_store::add_lines_tx(
+        &db,
+        token,
+        ch_id,
+        &currency,
+        &[checkout_store::NewLine {
+            variant_id: vid,
+            quantity: stock + 1,
+            unit_price: unit,
+            price_override: None,
+        }],
+    )
+    .await
+    .expect_err("over-stock quantity must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("INSUFFICIENT_STOCK") || msg.contains("QUANTITY_GREATER_THAN_LIMIT"),
+        "expected INSUFFICIENT_STOCK (or LIMIT when stock+1 exceeds it), got {msg}"
+    );
+
+    checkout_store::delete_checkout_row(&db, token)
+        .await
+        .unwrap();
 }

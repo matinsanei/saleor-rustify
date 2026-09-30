@@ -2187,12 +2187,19 @@ impl CommerceQuery {
         &self, ctx: &Context<'_>,
         first: Option<i32>, after: Option<String>, before: Option<String>, last: Option<i32>,
         filter: Option<gen::WarehouseFilterInput>, #[graphql(name = "sortBy")] sort_by: Option<gen::WarehouseSortingInput>,
+        channel: Option<String>,
     ) -> Result<gen::WarehouseCountableConnection> {
         let _ = (before, last, filter, sort_by);
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
         let off = after.and_then(|c| crate::common::decode_cursor(&c)).unwrap_or(0);
         let lim = first.unwrap_or(100).clamp(1, 100) as usize;
-        let rows = saleor_rustify_db::commerce::list_warehouses(db, "default-channel").await.map_err(|e| Error::new(e.to_string()))?;
+        // Warehouses are listed per channel (click&collect assignment);
+        // omitted channel means the deployment default.
+        let ch = channel
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(saleor_rustify_db::catalog::fallback_channel_slug);
+        let rows = saleor_rustify_db::commerce::list_warehouses(db, &ch).await.map_err(|e| Error::new(e.to_string()))?;
         let total = rows.len() as i32;
         let edges = rows.into_iter().skip(off).take(lim).map(|w| gen::WarehouseCountableEdge { node: Some(gen::Warehouse {
             id: Some(ID(crate::common::gid("Warehouse", &w.id))),
@@ -2455,7 +2462,7 @@ impl CommerceQuery {
 
     async fn shipping_methods(&self, ctx: &Context<'_>, channel: Option<String>) -> Result<Vec<GqlShippingMethod>> {
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
-        let ch = channel.unwrap_or_else(|| "default-channel".into());
+        let ch = channel.unwrap_or_else(saleor_rustify_db::catalog::fallback_channel_slug);
         let rows = saleor_rustify_db::commerce::list_shipping_methods(db, &ch).await.map_err(|e| Error::new(e.to_string()))?;
         Ok(rows.into_iter().map(|m| GqlShippingMethod { id: ID(crate::common::gid("ShippingMethod", m.id)), name: m.name, price: m.price_amount.to_string() }).collect())
     }
@@ -2485,7 +2492,7 @@ impl CommerceQuery {
     ) -> Result<gen::PromotionCountableConnection> {
         let _ = (before, last, where_input, sort_by);
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
-        let ch = channel.unwrap_or_else(|| "default-channel".into());
+        let ch = channel.unwrap_or_else(saleor_rustify_db::catalog::fallback_channel_slug);
         let off = after.and_then(|c| crate::common::decode_cursor(&c)).unwrap_or(0);
         let lim = first.unwrap_or(100).clamp(1, 100) as usize;
         let rows = saleor_rustify_db::commerce::list_promotions(db, &ch).await.map_err(|e| Error::new(e.to_string()))?;
@@ -4379,17 +4386,26 @@ impl CommerceMutation {
     /// Shop order settings (Django `orderSettingsUpdate`, 3.23 root): the
     /// dashboard drives these through `shopSettingsUpdate`; this root
     /// applies the same two flags to the default channel for schema callers.
-    async fn order_settings_update(&self, ctx: &Context<'_>, input: gen::OrderSettingsUpdateInput) -> Result<GqlOrderSettingsUpdate> {
+    async fn order_settings_update(
+        &self,
+        ctx: &Context<'_>,
+        input: gen::OrderSettingsUpdateInput,
+        channel: Option<String>,
+    ) -> Result<GqlOrderSettingsUpdate> {
         let _ = crate::account::require_perm(ctx, "manage_orders").await?;
         let g = ctx.data::<GqlContext>()?; let db = g.db()?;
         let err = |m: String| GqlOrderSettingsUpdate { order_settings: None, errors: vec![orerr(m)] };
+        let slug = channel
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(saleor_rustify_db::catalog::fallback_channel_slug);
         let mut patch = saleor_rustify_db::channels::ChannelSettingsPatch::default();
         patch.auto_confirm = input.automatically_confirm_all_new_orders;
         patch.auto_fulfill_gift = input.automatically_fulfill_non_shippable_gift_card;
         if patch.auto_confirm.is_none() && patch.auto_fulfill_gift.is_none() {
             return Ok(err("nothing to update".into()));
         }
-        if let Err(e) = saleor_rustify_db::channels::update_channel_settings(db, "default-channel", patch).await {
+        if let Err(e) = saleor_rustify_db::channels::update_channel_settings(db, &slug, patch).await {
             return Ok(err(e.to_string()));
         }
         Ok(GqlOrderSettingsUpdate { order_settings: None, errors: vec![] })
@@ -4775,7 +4791,9 @@ impl CommerceMutation {
         };
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
         if let Some(co) = saleor_rustify_db::entities::checkout_checkout::Entity::find_by_id(uuid).one(db).await.map_err(|e| Error::new(e.to_string()))? {
-            let ch = match co.channel_id { 2 => "channel-pln".to_string(), _ => "default-channel".to_string() };
+            let ch = saleor_rustify_db::catalog::channel_slug_for_id(db, co.channel_id)
+                .await
+                .map_err(|e| Error::new(e.to_string()))?;
             let mut am: saleor_rustify_db::entities::checkout_checkout::ActiveModel = co.into();
             am.tax_exemption = Set(tax_exemption);
             am.update(db).await.map_err(|e| Error::new(e.to_string()))?;

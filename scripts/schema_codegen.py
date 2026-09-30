@@ -643,6 +643,17 @@ LEGACY_FIELDS = {
     ],
 }
 
+# Custom-API compat fields: schema-known struct fields the dashboard never
+# selects but the storefront flow (custom API) queries. Same mechanics as
+# LEGACY_FIELDS (emitted as struct fields, populated by hand at assembly).
+# Plain (arg-less) fields only — methods with args go in REAL_METHODS.
+COMPAT_FIELDS = {
+    "Product": [
+        ("variants", "Option<Vec<ProductVariant>>"),
+        ("externalReference", "Option<String>"),
+    ],
+}
+
 # ComplexObject methods with REAL database logic (not stubs). Keyed
 # (struct, field); the value is Rust emitted verbatim with
 # `ctx: &Context<'_>` in scope. Everything else stays a zero-cost stub.
@@ -682,7 +693,7 @@ REAL_METHODS = {
     ("Category", "ancestors"): """{\n        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {\n            Some(d) => d.clone(),\n            None => return None,\n        };\n        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();\n        crate::catalog::category_ancestors(&db, &gid, _arg_first.clone()).await\n    }""",
     ("Category", "backgroundImage"): """{\n        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {\n            Some(d) => d.clone(),\n            None => return None,\n        };\n        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();\n        crate::catalog::category_bg_image(&db, &gid).await\n    }""",
     # Collection products tab + background image.
-    ("Collection", "products"): """{\n        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {\n            Some(d) => d.clone(),\n            None => return None,\n        };\n        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();\n        crate::catalog::collection_products(&db, &gid, _arg_first.clone(), _arg_after.clone()).await\n    }""",
+    ("Collection", "products"): """{\n        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {\n            Some(d) => d.clone(),\n            None => return None,\n        };\n        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();\n        crate::catalog::collection_products(&db, &gid, crate::catalog::request_channel(ctx).as_deref(), _arg_first.clone(), _arg_after.clone()).await\n    }""",
     ("Collection", "backgroundImage"): """{\n        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {\n            Some(d) => d.clone(),\n            None => return None,\n        };\n        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();\n        crate::catalog::collection_bg_image(&db, &gid).await\n    }""",
     # Attribute details relations.
     ("Attribute", "choices"): """{\n        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {\n            Some(d) => d.clone(),\n            None => return None,\n        };\n        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();\n        let search = _arg_search.clone();\n        crate::catalog::attribute_choices(&db, &gid, search, _arg_first.clone(), _arg_after.clone()).await\n    }""",
@@ -801,6 +812,27 @@ REAL_METHODS = {
             url: crate::common::media_url(&path),
             alt: Some(alt),
         })
+    }""",
+    # Storefront pricing (custom-API compat): variant + product price views.
+    # The schema carries no channel arg on nested pricing, so the channel
+    # comes request-scoped via `x-saleor-channel` (Saleor ChannelContext
+    # equivalent); see catalog::request_channel. Gateways MUST send it for
+    # multi-channel correctness.
+    ("ProductVariant", "pricing"): """{
+        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();
+        crate::catalog::variant_pricing_info(&db, &gid, crate::catalog::request_channel(ctx).as_deref()).await
+    }""",
+    ("Product", "pricing"): """{
+        let db = match ctx.data_opt::<crate::context::GqlContext>().and_then(|g| g.db().ok()) {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        let gid = self.id.as_ref().map(|i| i.0.clone()).unwrap_or_default();
+        crate::catalog::product_pricing_info(&db, &gid, crate::catalog::request_channel(ctx).as_deref()).await
     }""",
 }
 
@@ -942,7 +974,7 @@ def emit_all(reg, g, M):
 
     # ---- structs ----
     def legacy_ty(t, fname):
-        for lf, lr in LEGACY_FIELDS.get(t, []):
+        for lf, lr in LEGACY_FIELDS.get(t, []) + COMPAT_FIELDS.get(t, []):
             if lf == fname:
                 return lr
         return None
@@ -964,11 +996,17 @@ def emit_all(reg, g, M):
                 forced.update(info["fields"])
         out = [(f, g.usage.get(t, {}).get(f, False), f in forced)
                for f in order if f in sel or f in forced]
-        if t in LEGACY_FIELDS:
+        if t in LEGACY_FIELDS or t in COMPAT_FIELDS:
             have = {f for f, _, _ in out}
-            for fname, _rty in LEGACY_FIELDS[t]:
-                if fname not in have:
+            for fname, _rty in LEGACY_FIELDS.get(t, []) + COMPAT_FIELDS.get(t, []):
+                if fname not in have and fname in types[t]["fields"]:
                     out.append((fname, False, False))
+        # REAL_METHODS entries always emit, even when the dashboard never
+        # selects them (custom-API compat surface beyond dashboard usage).
+        have = {f for f, _, _ in out}
+        for (rt, rf) in REAL_METHODS:
+            if rt == t and rf not in have and rf in types[t]["fields"]:
+                out.append((rf, bool(types[t]["fields"][rf]["args"]), False))
         return out or fallback_fields(t)
 
     def fallback_fields(t):

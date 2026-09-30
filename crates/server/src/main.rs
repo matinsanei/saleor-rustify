@@ -182,6 +182,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 req = req.data(saleor_rustify_graphql::context::Bearer(bearer));
             }
+            // Multi-channel scoping for nested resolvers (pricing has no
+            // channel arg in the schema): gateways send the query's channel
+            // here; absent means default-channel, same as before.
+            if let Some(ch) = headers.get("x-saleor-channel")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                req = req.data(saleor_rustify_graphql::context::RequestChannel(ch));
+            }
             Json({
                 let resp = schema.execute(req).await;
                 if !resp.errors.is_empty() {

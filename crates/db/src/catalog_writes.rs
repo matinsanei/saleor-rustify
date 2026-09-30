@@ -609,12 +609,14 @@ pub async fn delete_category(db: &DatabaseConnection, id: i32) -> Result<()> {
 }
 
 /// Collection publication lives on the per-channel listing (3.x), not the
-/// collection row. Mirror the dashboard intent onto the default channel.
+/// collection row. Mirror the dashboard intent onto the deployment default
+/// channel (centralized fallback, never a literal).
 async fn set_collection_published(db: &impl ConnectionTrait, collection_id: i32, published: bool) -> Result<()> {
+    let slug = crate::catalog::fallback_channel_slug();
     let ch = Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT id FROM channel_channel WHERE slug = 'default-channel' LIMIT 1",
-        [],
+        "SELECT id FROM channel_channel WHERE slug = $1 LIMIT 1",
+        [slug.into()],
     );
     let ch_id: Option<i32> = db
         .query_one(ch)

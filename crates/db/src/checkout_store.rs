@@ -22,9 +22,8 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use saleor_rustify_core::{checkout::Checkout, money::Money};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
-    sea_query::LockType,
+    sea_query::LockType, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -50,6 +49,188 @@ pub struct NewLine {
     pub price_override: Option<Decimal>,
 }
 
+/// Structured line-validation failure (Saleor `CheckoutErrorCode` names +
+/// offending variants). Returned by [`validate_lines`]; API layers map it
+/// to their own error shapes, `add_lines_tx` funnels it into `DbError`.
+#[derive(Debug, Clone)]
+pub struct LinesInvalid {
+    pub code: &'static str,
+    pub message: String,
+    pub variants: Vec<i32>,
+}
+
+impl std::fmt::Display for LinesInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+/// Saleor write-path validation for checkout lines (`checkout_create.py`,
+/// `checkout_lines_add.py`, `mutations/utils.py`): variant exists, listed
+/// on the channel, product published + available for purchase, quantity
+/// within limits, stock covers it.
+///
+/// This is the shared choke point: `add_lines_tx` (GraphQL mutations AND
+/// gRPC handlers) runs it, so no writer can mint zero-priced or
+/// over-limit lines by skipping the API layer.
+pub async fn validate_lines(
+    db: &impl sea_orm::ConnectionTrait,
+    channel_id: i32,
+    items: &[(i32, i32)],
+) -> std::result::Result<(), LinesInvalid> {
+    use crate::entities::{
+        product_productchannellisting, product_productvariant,
+        product_productvariantchannellisting, site_sitesettings, warehouse_stock,
+    };
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+    let fail = |code: &'static str, msg: String, vids: Vec<i32>| LinesInvalid {
+        code,
+        message: msg,
+        variants: vids,
+    };
+    if items.is_empty() {
+        return Ok(());
+    }
+    let vids: Vec<i32> = items.iter().map(|(v, _)| *v).collect();
+    let found: Vec<i32> = product_productvariant::Entity::find()
+        .select_only()
+        .column(product_productvariant::Column::Id)
+        .filter(product_productvariant::Column::Id.is_in(vids.clone()))
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?;
+    let missing: Vec<i32> = vids.iter().filter(|v| !found.contains(v)).cloned().collect();
+    if !missing.is_empty() {
+        return Err(fail("NOT_FOUND", "variant not found".into(), missing));
+    }
+    let listed: Vec<i32> = product_productvariantchannellisting::Entity::find()
+        .select_only()
+        .column(product_productvariantchannellisting::Column::VariantId)
+        .filter(product_productvariantchannellisting::Column::VariantId.is_in(vids.clone()))
+        .filter(product_productvariantchannellisting::Column::ChannelId.eq(channel_id))
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?;
+    let unlisted: Vec<i32> = vids.iter().filter(|v| !listed.contains(v)).cloned().collect();
+    if !unlisted.is_empty() {
+        return Err(fail(
+            "UNAVAILABLE_VARIANT_IN_CHANNEL",
+            "variant is not available in this channel".into(),
+            unlisted,
+        ));
+    }
+    let prod_ids: Vec<i32> = product_productvariant::Entity::find()
+        .select_only()
+        .column(product_productvariant::Column::ProductId)
+        .filter(product_productvariant::Column::Id.is_in(vids.clone()))
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?;
+    let pubs: Vec<(i32, bool, Option<chrono::DateTime<chrono::FixedOffset>>, Option<chrono::DateTime<chrono::FixedOffset>>)> =
+        product_productchannellisting::Entity::find()
+        .select_only()
+        .column(product_productchannellisting::Column::ProductId)
+        .column(product_productchannellisting::Column::IsPublished)
+        .column(product_productchannellisting::Column::PublishedAt)
+        .column(product_productchannellisting::Column::AvailableForPurchaseAt)
+        .filter(product_productchannellisting::Column::ProductId.is_in(prod_ids))
+        .filter(product_productchannellisting::Column::ChannelId.eq(channel_id))
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?;
+    let now = chrono::Utc::now().fixed_offset();
+    let pub_ok: std::collections::HashSet<i32> = pubs
+        .into_iter()
+        .filter(|(_, pub_, at, avail)| {
+            *pub_ && at.map(|t| t <= now).unwrap_or(true) && avail.map(|t| t <= now).unwrap_or(true)
+        })
+        .map(|(p, _, _, _)| p)
+        .collect();
+    let var_prod: Vec<(i32, i32)> = product_productvariant::Entity::find()
+        .select_only()
+        .column(product_productvariant::Column::Id)
+        .column(product_productvariant::Column::ProductId)
+        .filter(product_productvariant::Column::Id.is_in(vids.clone()))
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?;
+    let unpublished: Vec<i32> = var_prod
+        .into_iter()
+        .filter(|(_, p)| !pub_ok.contains(p))
+        .map(|(v, _)| v)
+        .collect();
+    if !unpublished.is_empty() {
+        return Err(fail(
+            "PRODUCT_NOT_PUBLISHED",
+            "product is not published on this channel".into(),
+            unpublished,
+        ));
+    }
+    let zero: Vec<i32> = items.iter().filter(|(_, q)| *q < 1).map(|(v, _)| *v).collect();
+    if !zero.is_empty() {
+        return Err(fail("ZERO_QUANTITY", "quantity must be at least 1".into(), zero));
+    }
+    let limits: Vec<(i32, Option<i32>)> = product_productvariant::Entity::find()
+        .select_only()
+        .column(product_productvariant::Column::Id)
+        .column(product_productvariant::Column::QuantityLimitPerCustomer)
+        .filter(product_productvariant::Column::Id.is_in(vids.clone()))
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?;
+    let site_limit: Option<i32> = site_sitesettings::Entity::find()
+        .select_only()
+        .column(site_sitesettings::Column::LimitQuantityPerCheckout)
+        .into_tuple::<Option<i32>>()
+        .one(db)
+        .await
+        .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?
+        .flatten();
+    let over: Vec<i32> = items
+        .iter()
+        .filter(|(v, q)| {
+            let per = limits.iter().find(|(id, _)| id == v).and_then(|(_, l)| *l).or(site_limit);
+            per.map(|lim| *q > lim).unwrap_or(false)
+        })
+        .map(|(v, _)| *v)
+        .collect();
+    if !over.is_empty() {
+        return Err(fail(
+            "QUANTITY_GREATER_THAN_LIMIT",
+            "quantity is greater than the limit".into(),
+            over,
+        ));
+    }
+    let stocks = warehouse_stock::Entity::find()
+        .filter(warehouse_stock::Column::ProductVariantId.is_in(vids.clone()))
+        .all(db)
+        .await
+        .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?;
+    let mut avail: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    for s in stocks {
+        *avail.entry(s.product_variant_id).or_insert(0) += s.quantity - s.quantity_allocated;
+    }
+    let short: Vec<i32> = items
+        .iter()
+        .filter(|(v, q)| avail.get(v).copied().unwrap_or(0) < *q)
+        .map(|(v, _)| *v)
+        .collect();
+    if !short.is_empty() {
+        return Err(fail(
+            "INSUFFICIENT_STOCK",
+            "insufficient stock for the requested quantity".into(),
+            short,
+        ));
+    }
+    Ok(())
+}
+
 /// Insert a `checkout_checkout` row. Returns the Django token (PK).
 pub async fn create_checkout_row(
     db: &impl sea_orm::ConnectionTrait,
@@ -63,7 +244,11 @@ pub async fn create_checkout_row(
         token: Set(token),
         created_at: Set(t.into()),
         last_change: Set(t.into()),
-        email: Set(if email.is_empty() { None } else { Some(email.to_string()) }),
+        email: Set(if email.is_empty() {
+            None
+        } else {
+            Some(email.to_string())
+        }),
         channel_id: Set(channel_id),
         currency: Set(channel_currency.to_string()),
         country: Set("US".to_string()),
@@ -157,6 +342,11 @@ pub async fn add_lines_tx(
     for item in items {
         validate_quantity(item.quantity)?;
     }
+    // Shared write-path validation (stock/publish/limits/channel): every
+    // writer funnels through here, GraphQL and gRPC alike.
+    if let Err(inv) = validate_lines(db, channel_id, &items.iter().map(|i| (i.variant_id, i.quantity)).collect::<Vec<_>>()).await {
+        return Err(DbError::SeaOrm(sea_orm::DbErr::Custom(inv.to_string())));
+    }
     let txn = db.begin().await?;
     for item in items {
         // Merge target: same non-gift variant, no override (overridden lines
@@ -226,7 +416,9 @@ async fn evaluate_line_promotion(
         crate::promotions::clear_line_promotion_discounts(db, line_id).await?;
         return Ok(());
     };
-    let unit = line.price_override.unwrap_or(line.undiscounted_unit_price_amount);
+    let unit = line
+        .price_override
+        .unwrap_or(line.undiscounted_unit_price_amount);
     match crate::promotions::evaluate_line(
         db,
         channel_id,
@@ -246,11 +438,35 @@ async fn evaluate_line_promotion(
     Ok(())
 }
 
+/// Channel-listing price of a shipping method (Django resolves the
+/// checkout's shipping price from the method's listing on the channel).
+/// `None` when the method has no listing on the channel.
+pub async fn shipping_method_price(
+    db: &impl sea_orm::ConnectionTrait,
+    method_id: i32,
+    channel_id: i32,
+) -> Result<Option<Decimal>> {
+    use crate::entities::shipping_shippingmethodchannellisting;
+    Ok(shipping_shippingmethodchannellisting::Entity::find()
+        .filter(shipping_shippingmethodchannellisting::Column::ShippingMethodId.eq(method_id))
+        .filter(shipping_shippingmethodchannellisting::Column::ChannelId.eq(channel_id))
+        .one(db)
+        .await?
+        .map(|l| l.price_amount))
+}
+
 /// Recompute denormalized totals from lines (pre-tax: net == gross),
 /// subtracting catalogue promotion, order promotion (T3), and voucher
 /// discounts — the totals Django recalculates after line mutations.
 /// Floored at zero like Django's `max(total - discounts, zero)`.
 /// Gift lines total 0 by construction, so they need no term.
+///
+/// Django-shaped books (post shipping support):
+/// - `subtotal` = lines − line-level discounts (catalogue promos,
+///   specific-product vouchers). Order-level discounts do NOT touch it.
+/// - `shipping` = selected method's channel-listing price (0 when none),
+///   net of shipping-type voucher discounts.
+/// - `total` = subtotal − order promotions − order-level vouchers + shipping.
 pub async fn refresh_totals(
     db: &impl sea_orm::ConnectionTrait,
     checkout_token: Uuid,
@@ -260,32 +476,40 @@ pub async fn refresh_totals(
     // recalculation on refresh). Errors propagate — a broken promotion
     // must fail the mutation loudly, never charge a stale total.
     crate::order_promotions::refresh_order_promotion_in(db, checkout_token).await?;
+    let co = checkout_checkout::Entity::find_by_id(checkout_token)
+        .one(db)
+        .await?
+        .ok_or_else(|| DbError::CheckoutNotFound(checkout_token.to_string()))?;
     let lines = checkout_checkoutline::Entity::find()
         .filter(checkout_checkoutline::Column::CheckoutId.eq(checkout_token))
         .all(db)
         .await?;
-    let lines_sum: Decimal = lines
-        .iter()
-        .map(|l| l.total_price_gross_amount)
-        .sum();
+    let lines_sum: Decimal = lines.iter().map(|l| l.total_price_gross_amount).sum();
     let promo = crate::promotions::checkout_promotion_total(db, checkout_token).await?;
     let order_promo = crate::order_promotions::order_promotion_total(db, checkout_token).await?;
     let line_vouchers = crate::promotions::lines_voucher_total(db, checkout_token).await?;
     let order_vouchers = crate::promotions::checkout_voucher_total(db, checkout_token).await?;
-    let total = (lines_sum - promo - order_promo - line_vouchers - order_vouchers).max(Decimal::ZERO);
-    let mut co: checkout_checkout::ActiveModel = checkout_checkout::Entity::find_by_id(checkout_token)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbError::CheckoutNotFound(checkout_token.to_string()))?
-        .into();
-    co.total_net_amount = Set(total);
-    co.total_gross_amount = Set(total);
-    co.base_total_amount = Set(total);
-    co.subtotal_net_amount = Set(total);
-    co.subtotal_gross_amount = Set(total);
-    co.base_subtotal_amount = Set(total);
-    co.last_change = Set(now().into());
-    co.update(db).await?;
+    let ship_voucher = crate::promotions::shipping_voucher_total(db, checkout_token).await?;
+    let subtotal = (lines_sum - promo - line_vouchers).max(Decimal::ZERO);
+    let shipping = match co.shipping_method_id {
+        Some(mid) => shipping_method_price(db, mid, co.channel_id)
+            .await?
+            .unwrap_or(Decimal::ZERO),
+        None => Decimal::ZERO,
+    };
+    let shipping_net = (shipping - ship_voucher).max(Decimal::ZERO);
+    let total = (subtotal - order_promo - order_vouchers + shipping_net).max(Decimal::ZERO);
+    let mut am: checkout_checkout::ActiveModel = co.into();
+    am.total_net_amount = Set(total);
+    am.total_gross_amount = Set(total);
+    am.base_total_amount = Set(total);
+    am.subtotal_net_amount = Set(subtotal);
+    am.subtotal_gross_amount = Set(subtotal);
+    am.base_subtotal_amount = Set(subtotal);
+    am.shipping_price_net_amount = Set(shipping_net);
+    am.shipping_price_gross_amount = Set(shipping_net);
+    am.last_change = Set(now().into());
+    am.update(db).await?;
     Ok(())
 }
 
@@ -295,10 +519,7 @@ pub async fn load_checkout(
     db: &impl sea_orm::ConnectionTrait,
     token: Uuid,
 ) -> Result<Option<(checkout_checkout::Model, Vec<checkout_checkoutline::Model>)>> {
-    let Some(co) = checkout_checkout::Entity::find_by_id(token)
-        .one(db)
-        .await?
-    else {
+    let Some(co) = checkout_checkout::Entity::find_by_id(token).one(db).await? else {
         return Ok(None);
     };
     let lines = checkout_checkoutline::Entity::find()
@@ -314,22 +535,25 @@ pub async fn load_checkout(
 /// no DB-level `ON DELETE CASCADE` (the ORM collector deletes dependents
 /// first), so the order is: line discounts → checkout discounts → lines →
 /// checkout — same end state as `checkout.delete()`.
-pub async fn delete_checkout_row(
-    db: &impl sea_orm::ConnectionTrait,
-    token: Uuid,
-) -> Result<()> {
+pub async fn delete_checkout_row(db: &impl sea_orm::ConnectionTrait, token: Uuid) -> Result<()> {
     use crate::entities::{discount_checkoutdiscount, discount_checkoutlinediscount};
     // Saleor `SET_NULL` on TransactionItem.checkout / Payment.checkout: the
     // money trail survives its checkout, detached (Django collector NULLs
     // instead of cascading).
     use crate::entities::{payment_payment, payment_transactionitem};
     payment_transactionitem::Entity::update_many()
-        .col_expr(payment_transactionitem::Column::CheckoutId, sea_orm::sea_query::Expr::value(None::<Uuid>))
+        .col_expr(
+            payment_transactionitem::Column::CheckoutId,
+            sea_orm::sea_query::Expr::value(None::<Uuid>),
+        )
         .filter(payment_transactionitem::Column::CheckoutId.eq(token))
         .exec(db)
         .await?;
     payment_payment::Entity::update_many()
-        .col_expr(payment_payment::Column::CheckoutId, sea_orm::sea_query::Expr::value(None::<Uuid>))
+        .col_expr(
+            payment_payment::Column::CheckoutId,
+            sea_orm::sea_query::Expr::value(None::<Uuid>),
+        )
         .filter(payment_payment::Column::CheckoutId.eq(token))
         .exec(db)
         .await?;
@@ -376,15 +600,19 @@ pub async fn delete_checkout_row(
 /// Deletes reuse `delete_checkout_row` (discounts + reservations + lines +
 /// header, FK-safe order); each row is locked `FOR UPDATE` first like
 /// Django's `delete_checkouts`. Batched 2000 x up to 5 passes per run.
-pub async fn sweep_expired_checkouts(
-    db: &DatabaseConnection,
-) -> Result<u64> {
+pub async fn sweep_expired_checkouts(db: &DatabaseConnection) -> Result<u64> {
     fn env_u64(name: &str, dflt: u64) -> u64 {
-        std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(dflt)
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(dflt)
     }
-    let anon_cut = Utc::now() - chrono::Duration::days(env_u64("RUSTIFY_ANONYMOUS_CHECKOUT_DAYS", 30) as i64);
-    let user_cut = Utc::now() - chrono::Duration::days(env_u64("RUSTIFY_USER_CHECKOUT_DAYS", 90) as i64);
-    let empty_cut = Utc::now() - chrono::Duration::hours(env_u64("RUSTIFY_EMPTY_CHECKOUT_HOURS", 6) as i64);
+    let anon_cut =
+        Utc::now() - chrono::Duration::days(env_u64("RUSTIFY_ANONYMOUS_CHECKOUT_DAYS", 30) as i64);
+    let user_cut =
+        Utc::now() - chrono::Duration::days(env_u64("RUSTIFY_USER_CHECKOUT_DAYS", 90) as i64);
+    let empty_cut =
+        Utc::now() - chrono::Duration::hours(env_u64("RUSTIFY_EMPTY_CHECKOUT_HOURS", 6) as i64);
     let mut total: u64 = 0;
     for _ in 0..5 {
         let sel = sea_orm::Statement::from_sql_and_values(
@@ -464,13 +692,16 @@ pub async fn auto_complete_expired_checkouts(
     db: &DatabaseConnection,
 ) -> Result<AutoCompleteReport> {
     fn env_u64(name: &str, dflt: u64) -> u64 {
-        std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(dflt)
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(dflt)
     }
     let batch = env_u64("RUSTIFY_AUTO_COMPLETE_BATCH", 20).clamp(1, 500) as i64;
-    let oldest_cut =
-        Utc::now() - chrono::Duration::days(env_u64("RUSTIFY_AUTO_COMPLETE_MAX_AGE_DAYS", 30) as i64);
-    let retry_cut =
-        Utc::now() - chrono::Duration::hours(env_u64("RUSTIFY_AUTO_COMPLETE_RETRY_HOURS", 24) as i64);
+    let oldest_cut = Utc::now()
+        - chrono::Duration::days(env_u64("RUSTIFY_AUTO_COMPLETE_MAX_AGE_DAYS", 30) as i64);
+    let retry_cut = Utc::now()
+        - chrono::Duration::hours(env_u64("RUSTIFY_AUTO_COMPLETE_RETRY_HOURS", 24) as i64);
     let sel = sea_orm::Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "SELECT c.token FROM checkout_checkout c \
@@ -598,7 +829,9 @@ macro_rules! checkout_setter {
             value: $ty,
         ) -> Result<()> {
             use sea_orm::EntityTrait;
-            let Some(co) = checkout_checkout::Entity::find_by_id(checkout_token).one(db).await?
+            let Some(co) = checkout_checkout::Entity::find_by_id(checkout_token)
+                .one(db)
+                .await?
             else {
                 return Err(DbError::CheckoutNotFound(checkout_token.to_string()));
             };
@@ -652,7 +885,9 @@ pub async fn set_checkout_address(
     .insert(db)
     .await?
     .id;
-    let Some(co) = checkout_checkout::Entity::find_by_id(checkout_token).one(db).await?
+    let Some(co) = checkout_checkout::Entity::find_by_id(checkout_token)
+        .one(db)
+        .await?
     else {
         return Err(DbError::CheckoutNotFound(checkout_token.to_string()));
     };
@@ -674,7 +909,9 @@ pub async fn remove_voucher_code(
     code: Option<&str>,
 ) -> Result<bool> {
     use sea_orm::EntityTrait;
-    let Some(co) = checkout_checkout::Entity::find_by_id(checkout_token).one(db).await?
+    let Some(co) = checkout_checkout::Entity::find_by_id(checkout_token)
+        .one(db)
+        .await?
     else {
         return Err(DbError::CheckoutNotFound(checkout_token.to_string()));
     };

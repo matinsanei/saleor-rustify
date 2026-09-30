@@ -61,7 +61,10 @@ impl OrderService for OrderServiceImpl {
                 .map_err(|e| Status::internal(e.to_string()))?
             {
                 Some((header, lines)) => {
-                    let domain = order_store::to_domain(&header, &lines, "default-channel");
+                    let ch_slug = saleor_rustify_db::catalog::channel_slug_for_id(db, header.channel_id)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    let domain = order_store::to_domain(&header, &lines, &ch_slug);
                     return Ok(Response::new(GetOrderResponse {
                         order: Some(domain.to_proto()),
                         errors: vec![],
@@ -116,7 +119,10 @@ impl OrderService for OrderServiceImpl {
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
                 {
-                    orders.push(order_store::to_domain(&header, &lines, "default-channel").to_proto());
+                    let ch_slug = saleor_rustify_db::catalog::channel_slug_for_id(db, header.channel_id)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    orders.push(order_store::to_domain(&header, &lines, &ch_slug).to_proto());
                 }
             }
             return Ok(Response::new(ListOrdersResponse {

@@ -22,8 +22,8 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use saleor_rustify_core::psp::{Psp, PspAction, PspOutcome};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect,
-    Set, sea_query::LockType,
+    sea_query::LockType, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
+    QueryFilter, QuerySelect, Set,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -75,10 +75,7 @@ impl std::fmt::Debug for TxnView {
 
 impl TxnView {
     fn pending_total(&self) -> Decimal {
-        self.authorize_pending
-            + self.charge_pending
-            + self.refund_pending
-            + self.cancel_pending
+        self.authorize_pending + self.charge_pending + self.refund_pending + self.cancel_pending
     }
 }
 
@@ -90,10 +87,7 @@ impl TxnView {
 /// bucket > 0). The double-Pay-button then fails fast with
 /// `ALREADY_IN_PROGRESS` instead of double-charging; retry after failure
 /// or settle is unaffected (failed/settled transactions hold no pending).
-pub async fn create_transaction(
-    db: &DatabaseConnection,
-    new: &NewTransaction,
-) -> Result<TxnView> {
+pub async fn create_transaction(db: &DatabaseConnection, new: &NewTransaction) -> Result<TxnView> {
     use sea_orm::TransactionTrait;
     let txn = db.begin().await?;
     if let (Some(app), Some(key)) = (new.app_identifier.clone(), new.idempotency_key.clone()) {
@@ -369,10 +363,14 @@ async fn recalc_in(db: &impl sea_orm::ConnectionTrait, transaction_id: i32) -> R
     let row = payment_transactionitem::Entity::find_by_id(transaction_id)
         .one(db)
         .await?
-        .ok_or_else(|| DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(transaction_id.to_string())))?;
+        .ok_or_else(|| {
+            DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(transaction_id.to_string()))
+        })?;
     let mut am: payment_transactionitem::ActiveModel = row.into();
-    am.authorized_value = Set(b.authorized);
-    am.authorize_pending_value = Set(b.authorize_pending);
+    // Django `recalculate_transaction_amounts` clamps these two floors;
+    // charged/refunded/canceled are left unclamped upstream too.
+    am.authorized_value = Set(b.authorized.max(Decimal::ZERO));
+    am.authorize_pending_value = Set(b.authorize_pending.max(Decimal::ZERO));
     am.charged_value = Set(b.charged);
     am.charge_pending_value = Set(b.charge_pending);
     am.refunded_value = Set(b.refunded);
@@ -384,10 +382,7 @@ async fn recalc_in(db: &impl sea_orm::ConnectionTrait, transaction_id: i32) -> R
     Ok(())
 }
 
-pub async fn view(
-    db: &impl sea_orm::ConnectionTrait,
-    transaction_id: i32,
-) -> Result<TxnView> {
+pub async fn view(db: &impl sea_orm::ConnectionTrait, transaction_id: i32) -> Result<TxnView> {
     let row = payment_transactionitem::Entity::find_by_id(transaction_id)
         .one(db)
         .await?
@@ -424,19 +419,20 @@ pub async fn refresh_order_statuses(
         .filter(payment_transactionitem::Column::OrderId.eq(oid))
         .all(db)
         .await?;
-    let auth_covered: Decimal = txns.iter().map(|t| t.authorized_value + t.charged_value).sum();
+    let auth_covered: Decimal = txns
+        .iter()
+        .map(|t| t.authorized_value + t.charged_value)
+        .sum();
     let charge_covered: Decimal = txns.iter().map(|t| t.charged_value).sum();
     let Some(order) = order_order::Entity::find_by_id(oid).one(db).await? else {
         return Ok(());
     };
     let total = order.total_gross_amount;
     let mut am: order_order::ActiveModel = order.into();
-    am.authorize_status = Set(
-        saleor_rustify_core::payments::coverage_status(auth_covered, total).to_string(),
-    );
-    am.charge_status = Set(
-        saleor_rustify_core::payments::coverage_status(charge_covered, total).to_string(),
-    );
+    am.authorize_status =
+        Set(saleor_rustify_core::payments::coverage_status(auth_covered, total).to_string());
+    am.charge_status =
+        Set(saleor_rustify_core::payments::coverage_status(charge_covered, total).to_string());
     am.update(db).await?;
     Ok(())
 }
@@ -468,7 +464,9 @@ async fn set_actions(
     let row = payment_transactionitem::Entity::find_by_id(transaction_id)
         .one(db)
         .await?
-        .ok_or_else(|| DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(transaction_id.to_string())))?;
+        .ok_or_else(|| {
+            DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(transaction_id.to_string()))
+        })?;
     let mut am: payment_transactionitem::ActiveModel = row.into();
     am.available_actions = Set(actions.iter().map(|s| s.to_string()).collect());
     if let Some(psp) = psp_reference {
@@ -575,36 +573,101 @@ pub async fn execute_via(
     };
     match psp.execute(&req) {
         PspOutcome::Completed { psp_reference } => {
-            report_event(db, transaction_id, &mk(action.request_event(), format!("{idempotency_key}-req"), Some(psp_reference.clone()))).await?;
-            report_event(db, transaction_id, &mk(action.success_event(), format!("{idempotency_key}-ok"), Some(psp_reference.clone()))).await?;
+            report_event(
+                db,
+                transaction_id,
+                &mk(
+                    action.request_event(),
+                    format!("{idempotency_key}-req"),
+                    Some(psp_reference.clone()),
+                ),
+            )
+            .await?;
+            report_event(
+                db,
+                transaction_id,
+                &mk(
+                    action.success_event(),
+                    format!("{idempotency_key}-ok"),
+                    Some(psp_reference.clone()),
+                ),
+            )
+            .await?;
             if let Some(actions) = post_actions(action) {
                 set_actions(db, transaction_id, actions, Some(psp_reference)).await?;
             }
-            Ok(PspOutcomeView { txn: view(db, transaction_id).await?, action_required: false, redirect_url: None })
+            Ok(PspOutcomeView {
+                txn: view(db, transaction_id).await?,
+                action_required: false,
+                redirect_url: None,
+            })
         }
         PspOutcome::Pending { psp_reference } => {
-            report_event(db, transaction_id, &mk(action.request_event(), format!("{idempotency_key}-req"), Some(psp_reference))).await?;
-            Ok(PspOutcomeView { txn: view(db, transaction_id).await?, action_required: false, redirect_url: None })
+            report_event(
+                db,
+                transaction_id,
+                &mk(
+                    action.request_event(),
+                    format!("{idempotency_key}-req"),
+                    Some(psp_reference),
+                ),
+            )
+            .await?;
+            Ok(PspOutcomeView {
+                txn: view(db, transaction_id).await?,
+                action_required: false,
+                redirect_url: None,
+            })
         }
-        PspOutcome::ActionRequired { psp_reference, redirect_url, message } => {
+        PspOutcome::ActionRequired {
+            psp_reference,
+            redirect_url,
+            message,
+        } => {
             let Some(challenge) = action.action_required_event() else {
-                return Err(gateway_err(format!("{verb} does not support customer challenges")));
+                return Err(gateway_err(format!(
+                    "{verb} does not support customer challenges"
+                )));
             };
-            report_event(db, transaction_id, &mk(action.request_event(), format!("{idempotency_key}-req"), Some(psp_reference.clone()))).await?;
-            let mut chal = mk(challenge, format!("{idempotency_key}-3ds"), Some(psp_reference));
+            report_event(
+                db,
+                transaction_id,
+                &mk(
+                    action.request_event(),
+                    format!("{idempotency_key}-req"),
+                    Some(psp_reference.clone()),
+                ),
+            )
+            .await?;
+            let mut chal = mk(
+                challenge,
+                format!("{idempotency_key}-3ds"),
+                Some(psp_reference),
+            );
             chal.message = message;
             chal.external_url = Some(redirect_url.clone());
             report_event(db, transaction_id, &chal).await?;
-            Ok(PspOutcomeView { txn: view(db, transaction_id).await?, action_required: true, redirect_url: Some(redirect_url) })
+            Ok(PspOutcomeView {
+                txn: view(db, transaction_id).await?,
+                action_required: true,
+                redirect_url: Some(redirect_url),
+            })
         }
         PspOutcome::Failed { error } => {
             // Permanent record that moves nothing (failure role in an
             // otherwise empty group), then the error. Same-key retry
             // replays state via the idempotency check.
-            let mut fail = mk(action.failure_event(), format!("{idempotency_key}-fail"), None);
+            let mut fail = mk(
+                action.failure_event(),
+                format!("{idempotency_key}-fail"),
+                None,
+            );
             fail.message = error.clone();
             let _ = report_event(db, transaction_id, &fail).await;
-            Err(gateway_err(format!("{verb} failed at {}: {error}", psp.name())))
+            Err(gateway_err(format!(
+                "{verb} failed at {}: {error}",
+                psp.name()
+            )))
         }
     }
 }
@@ -629,8 +692,16 @@ pub async fn psp_callback(
     message: &str,
     idempotency_key: &str,
 ) -> Result<CallbackOutcome> {
-    let terminal = if success { action.success_event() } else { action.failure_event() };
-    let other = if success { action.failure_event() } else { action.success_event() };
+    let terminal = if success {
+        action.success_event()
+    } else {
+        action.failure_event()
+    };
+    let other = if success {
+        action.failure_event()
+    } else {
+        action.success_event()
+    };
     let existing: Vec<String> = payment_transactionevent::Entity::find()
         .select_only()
         .column(payment_transactionevent::Column::Type)
@@ -639,14 +710,20 @@ pub async fn psp_callback(
         .into_tuple::<String>()
         .all(db)
         .await?;
-    if !existing.iter().any(|t| t == action.request_event() || t.ends_with("_action_required")) {
+    if !existing
+        .iter()
+        .any(|t| t == action.request_event() || t.ends_with("_action_required"))
+    {
         return Err(gateway_err(format!(
             "no pending {} request with psp_reference {psp_reference} (UNKNOWN_REQUEST)",
             action.request_event()
         )));
     }
     if existing.iter().any(|t| t == terminal) {
-        return Ok(CallbackOutcome { view: view(db, transaction_id).await?, replayed: true });
+        return Ok(CallbackOutcome {
+            view: view(db, transaction_id).await?,
+            replayed: true,
+        });
     }
     if existing.iter().any(|t| t == other) {
         return Err(gateway_err(format!(
@@ -685,7 +762,10 @@ pub async fn psp_callback(
             set_actions(db, transaction_id, actions, Some(psp_reference.to_string())).await?;
         }
     }
-    Ok(CallbackOutcome { view: view(db, transaction_id).await?, replayed: false })
+    Ok(CallbackOutcome {
+        view: view(db, transaction_id).await?,
+        replayed: false,
+    })
 }
 
 /// Django's escape hatch for the single-success rule: overwrite the
@@ -726,7 +806,18 @@ pub async fn authorize(
     idempotency_key: &str,
 ) -> Result<TxnView> {
     use saleor_rustify_core::psp::ManualPsp;
-    Ok(execute_via(db, transaction_id, PspAction::Authorize, amount, idempotency_key, &ManualPsp, None, None).await?.txn)
+    Ok(execute_via(
+        db,
+        transaction_id,
+        PspAction::Authorize,
+        amount,
+        idempotency_key,
+        &ManualPsp,
+        None,
+        None,
+    )
+    .await?
+    .txn)
 }
 
 /// Charge previously authorized funds. Guarded: never above the
@@ -738,7 +829,18 @@ pub async fn charge(
     idempotency_key: &str,
 ) -> Result<TxnView> {
     use saleor_rustify_core::psp::ManualPsp;
-    Ok(execute_via(db, transaction_id, PspAction::Charge, amount, idempotency_key, &ManualPsp, None, None).await?.txn)
+    Ok(execute_via(
+        db,
+        transaction_id,
+        PspAction::Charge,
+        amount,
+        idempotency_key,
+        &ManualPsp,
+        None,
+        None,
+    )
+    .await?
+    .txn)
 }
 
 /// Refund charged funds. Guarded: never above charged-minus-refunded.
@@ -749,7 +851,18 @@ pub async fn refund(
     idempotency_key: &str,
 ) -> Result<TxnView> {
     use saleor_rustify_core::psp::ManualPsp;
-    Ok(execute_via(db, transaction_id, PspAction::Refund, amount, idempotency_key, &ManualPsp, None, None).await?.txn)
+    Ok(execute_via(
+        db,
+        transaction_id,
+        PspAction::Refund,
+        amount,
+        idempotency_key,
+        &ManualPsp,
+        None,
+        None,
+    )
+    .await?
+    .txn)
 }
 
 /// Transactional core of a sync manual refund: same guards as [`refund`],
@@ -820,7 +933,14 @@ pub async fn refund_for_grant(
 ) -> Result<TxnView> {
     use sea_orm::TransactionTrait;
     let txn = db.begin().await?;
-    refund_in(&txn, transaction_id, amount, idempotency_key, Some(grant_id)).await?;
+    refund_in(
+        &txn,
+        transaction_id,
+        amount,
+        idempotency_key,
+        Some(grant_id),
+    )
+    .await?;
     txn.commit().await?;
     let v = view(db, transaction_id).await?;
     refresh_order_statuses(db, v.order_id).await?;
@@ -835,7 +955,18 @@ pub async fn cancel(
     idempotency_key: &str,
 ) -> Result<TxnView> {
     use saleor_rustify_core::psp::ManualPsp;
-    Ok(execute_via(db, transaction_id, PspAction::Cancel, amount, idempotency_key, &ManualPsp, None, None).await?.txn)
+    Ok(execute_via(
+        db,
+        transaction_id,
+        PspAction::Cancel,
+        amount,
+        idempotency_key,
+        &ManualPsp,
+        None,
+        None,
+    )
+    .await?
+    .txn)
 }
 
 /// Django `transactionUpdate` money path (`create_manual_adjustment_events`
@@ -873,7 +1004,9 @@ pub async fn apply_amount_targets(
             // ADJUSTMENTs (Django switches on prior SUCCESS existence).
             let has_success: bool = payment_transactionevent::Entity::find()
                 .filter(payment_transactionevent::Column::TransactionId.eq(transaction_id))
-                .filter(payment_transactionevent::Column::Type.eq("authorization_success".to_string()))
+                .filter(
+                    payment_transactionevent::Column::Type.eq("authorization_success".to_string()),
+                )
                 .one(db)
                 .await?
                 .is_some();
@@ -902,9 +1035,21 @@ pub async fn apply_amount_targets(
     }
     // Additive families: deltas as SUCCESS events; shrinkage rejected.
     for (family, target, current) in [
-        ("charge", targets.charged, view(db, transaction_id).await?.charged),
-        ("refund", targets.refunded, view(db, transaction_id).await?.refunded),
-        ("cancel", targets.canceled, view(db, transaction_id).await?.canceled),
+        (
+            "charge",
+            targets.charged,
+            view(db, transaction_id).await?.charged,
+        ),
+        (
+            "refund",
+            targets.refunded,
+            view(db, transaction_id).await?.refunded,
+        ),
+        (
+            "cancel",
+            targets.canceled,
+            view(db, transaction_id).await?.canceled,
+        ),
     ] {
         let Some(t) = target else { continue };
         if t < Decimal::ZERO {
@@ -965,12 +1110,18 @@ pub async fn update_transaction_scalars(
             .await?
             .is_some();
         if clash {
-            return Err(gateway_err("transaction with provided pspReference already exists"));
+            return Err(gateway_err(
+                "transaction with provided pspReference already exists",
+            ));
         }
     }
-    let Some(m) = payment_transactionitem::Entity::find_by_id(transaction_id).one(db).await?
+    let Some(m) = payment_transactionitem::Entity::find_by_id(transaction_id)
+        .one(db)
+        .await?
     else {
-        return Err(DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(transaction_id.to_string())));
+        return Err(DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(
+            transaction_id.to_string(),
+        )));
     };
     let cur_md = serde_json::to_value(&m.metadata).unwrap_or(serde_json::Value::Null);
     let cur_pmd = serde_json::to_value(&m.private_metadata).unwrap_or(serde_json::Value::Null);
@@ -1029,13 +1180,25 @@ pub async fn request_action(
     } else {
         amount
     };
-    execute_via(db, transaction_id, action, amount, idempotency_key, psp, None, None).await?;
+    execute_via(
+        db,
+        transaction_id,
+        action,
+        amount,
+        idempotency_key,
+        psp,
+        None,
+        None,
+    )
+    .await?;
     if let Some(msg) = message.filter(|m| !m.trim().is_empty()) {
         // Annotate the request event (Django surfaces refundReason this way).
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
         if let Some(ev) = payment_transactionevent::Entity::find()
             .filter(payment_transactionevent::Column::TransactionId.eq(transaction_id))
-            .filter(payment_transactionevent::Column::IdempotencyKey.eq(idempotency_key.to_string()))
+            .filter(
+                payment_transactionevent::Column::IdempotencyKey.eq(idempotency_key.to_string()),
+            )
             .order_by_desc(payment_transactionevent::Column::Id)
             .one(db)
             .await?
@@ -1133,7 +1296,9 @@ pub async fn capture_legacy_payment(
     }
     if m.captured_amount + amount > m.total {
         txn.rollback().await?;
-        return Err(gateway_err("cannot capture more than the uncaptured remainder"));
+        return Err(gateway_err(
+            "cannot capture more than the uncaptured remainder",
+        ));
     }
     let refunded = refunded_so_far(&m);
     let mut am: payment_payment::ActiveModel = m.into();
@@ -1169,7 +1334,9 @@ pub async fn refund_legacy_payment(
     let refunded = refunded_so_far(&m);
     if refunded + amount > m.captured_amount {
         txn.rollback().await?;
-        return Err(gateway_err("cannot refund more than captured-minus-refunded"));
+        return Err(gateway_err(
+            "cannot refund more than captured-minus-refunded",
+        ));
     }
     let refunded = refunded + amount;
     let mut extra: serde_json::Value =
@@ -1180,7 +1347,12 @@ pub async fn refund_legacy_payment(
     extra["refunded"] = serde_json::Value::String(refunded.to_string());
     let mut am: payment_payment::ActiveModel = m.into();
     am.extra_data = Set(extra.to_string());
-    am.charge_status = Set(legacy_status(am.total.clone().unwrap(), am.captured_amount.clone().unwrap(), refunded, am.is_active.clone().unwrap()));
+    am.charge_status = Set(legacy_status(
+        am.total.clone().unwrap(),
+        am.captured_amount.clone().unwrap(),
+        refunded,
+        am.is_active.clone().unwrap(),
+    ));
     am.modified_at = Set(chrono::Utc::now().into());
     let m2 = am.update(&txn).await?;
     txn.commit().await?;
@@ -1201,7 +1373,9 @@ pub async fn void_legacy_payment(db: &DatabaseConnection, payment_id: i32) -> Re
     };
     if m.captured_amount > Decimal::ZERO {
         txn.rollback().await?;
-        return Err(gateway_err("cannot void a captured payment; refund instead"));
+        return Err(gateway_err(
+            "cannot void a captured payment; refund instead",
+        ));
     }
     if !m.is_active {
         txn.rollback().await?;
@@ -1268,7 +1442,11 @@ pub async fn initialize_transaction(
         },
     )
     .await?;
-    let ty = if spec.charge_flow { "charge_request" } else { "authorization_request" };
+    let ty = if spec.charge_flow {
+        "charge_request"
+    } else {
+        "authorization_request"
+    };
     report_event(
         db,
         t.id,
@@ -1317,7 +1495,9 @@ pub async fn outstanding(
         None
     };
     let Some(total) = total else {
-        return Err(gateway_err("transaction is not linked to a checkout or order"));
+        return Err(gateway_err(
+            "transaction is not linked to a checkout or order",
+        ));
     };
     let rest = (total - item.charged_value).max(Decimal::ZERO);
     if rest <= Decimal::ZERO {

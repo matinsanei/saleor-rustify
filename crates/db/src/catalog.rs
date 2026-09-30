@@ -16,14 +16,12 @@ use saleor_rustify_core::{
     money::Money,
     product::{Category, Product, ProductVariant},
 };
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect,
-};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 
 use crate::{
     entities::{
-        channel_channel, product_category, product_product,
-        product_productchannellisting, product_productvariant,
-        product_productvariantchannellisting,
+        channel_channel, product_category, product_product, product_productchannellisting,
+        product_productvariant, product_productvariantchannellisting,
     },
     DbError, Result,
 };
@@ -47,7 +45,8 @@ async fn channel_id(db: &impl sea_orm::ConnectionTrait, slug: &str) -> Result<(i
 }
 
 /// Public channel resolution: (channel_id, currency_code).
-pub async fn channel_info(db: &impl sea_orm::ConnectionTrait, slug: &str) -> Result<(i32, String)> {    channel_channel::Entity::find()
+pub async fn channel_info(db: &impl sea_orm::ConnectionTrait, slug: &str) -> Result<(i32, String)> {
+    channel_channel::Entity::find()
         .select_only()
         .column(channel_channel::Column::Id)
         .column(channel_channel::Column::CurrencyCode)
@@ -70,6 +69,23 @@ pub async fn channel_slug_for_id(
         .one(db)
         .await?
         .ok_or_else(|| DbError::SeaOrm(sea_orm::DbErr::RecordNotFound(channel_id.to_string())))
+}
+
+/// Deployment default channel slug — the ONLY sanctioned fallback, for
+/// callers that supply no channel at all (omitted root args, headerless
+/// nested resolvers, channel-agnostic exports). Overridable via
+/// `RUSTIFY_DEFAULT_CHANNEL`.
+///
+/// This must NEVER substitute for a known channel: checkout/order rows
+/// carry `channel_id` (resolve via [`channel_slug_for_id`]), and nested
+/// pricing prefers the request header / unambiguous single listing.
+/// A literal `"default-channel"` anywhere else is a bug — grep for it.
+pub fn fallback_channel_slug() -> String {
+    std::env::var("RUSTIFY_DEFAULT_CHANNEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default-channel".into())
 }
 
 fn published_filter(
@@ -113,8 +129,8 @@ async fn load_products_batch(
     ch_id: i32,
     currency: &str,
 ) -> Result<Vec<Product>> {
-    use std::collections::HashMap;
     use crate::entities::warehouse_stock;
+    use std::collections::HashMap;
 
     let pids: Vec<i32> = rows.iter().map(|r| r.0).collect();
     let variants = product_productvariant::Entity::find()
@@ -145,7 +161,9 @@ async fn load_products_batch(
 
     let mut by_product: HashMap<i32, Vec<ProductVariant>> = HashMap::new();
     for v in variants {
-        let Some(price) = listing_map.get(&v.id) else { continue };
+        let Some(price) = listing_map.get(&v.id) else {
+            continue;
+        };
         let pv = ProductVariant {
             id: v.id.to_string(),
             product_id: v.product_id.to_string(),
@@ -159,25 +177,27 @@ async fn load_products_batch(
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, slug, description, product_type_id, category_id)| {
-            let variants = by_product.remove(&id).unwrap_or_default();
-            let default_price = variants
-                .iter()
-                .map(|v| v.price.clone())
-                .min_by(|a, b| a.amount.cmp(&b.amount))
-                .unwrap_or_else(|| Money::zero(currency));
-            Product {
-                id: id.to_string(),
-                name,
-                slug,
-                description,
-                product_type_id: product_type_id.to_string(),
-                category_id: category_id.map(|c| c.to_string()),
-                is_published: true,
-                default_price,
-                variants,
-            }
-        })
+        .map(
+            |(id, name, slug, description, product_type_id, category_id)| {
+                let variants = by_product.remove(&id).unwrap_or_default();
+                let default_price = variants
+                    .iter()
+                    .map(|v| v.price.clone())
+                    .min_by(|a, b| a.amount.cmp(&b.amount))
+                    .unwrap_or_else(|| Money::zero(currency));
+                Product {
+                    id: id.to_string(),
+                    name,
+                    slug,
+                    description,
+                    product_type_id: product_type_id.to_string(),
+                    category_id: category_id.map(|c| c.to_string()),
+                    is_published: true,
+                    default_price,
+                    variants,
+                }
+            },
+        )
         .collect())
 }
 
@@ -204,7 +224,8 @@ pub async fn get_product(
     db: &impl sea_orm::ConnectionTrait,
     channel_slug: &str,
     product_id: i32,
-) -> Result<Option<Product>> {    let (ch_id, currency) = channel_id(db, channel_slug).await?;
+) -> Result<Option<Product>> {
+    let (ch_id, currency) = channel_id(db, channel_slug).await?;
     let row: Option<ProductRow> = product_select()
         .filter(product_product::Column::Id.eq(product_id))
         .into_tuple()
@@ -281,8 +302,7 @@ pub async fn checkout_pricing(
         .into_tuple::<ProductRow>()
         .all(db)
         .await?;
-    let names: HashMap<i32, String> =
-        products.into_iter().map(|r| (r.0, r.1)).collect();
+    let names: HashMap<i32, String> = products.into_iter().map(|r| (r.0, r.1)).collect();
 
     let mut out = HashMap::new();
     for v in variants {
@@ -324,13 +344,9 @@ async fn stock_for(db: &impl sea_orm::ConnectionTrait, variant_id: i32) -> Resul
         .filter(warehouse_stock::Column::ProductVariantId.eq(variant_id))
         .all(db)
         .await?;
-    let qty: i32 = rows
-        .iter()
-        .map(|s| s.quantity - s.quantity_allocated)
-        .sum();
+    let qty: i32 = rows.iter().map(|s| s.quantity - s.quantity_allocated).sum();
     Ok(qty.max(0))
 }
-
 
 // ---------------------------------------------------------------------------
 // Server-side filtering (Saleor filter/where semantics, dashboard-driven).
@@ -344,9 +360,7 @@ pub fn parse_gid(s: &str) -> Option<i32> {
         return Some(n);
     }
     use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
     let t = String::from_utf8(bytes).ok()?;
     t.split_once(':')?.1.parse::<i32>().ok()
 }
@@ -372,15 +386,16 @@ pub struct ProductListFilter {
     /// Saleor `isPublished` = channel-listing flag for the queried channel.
     pub is_published: Option<bool>,
     pub has_category: Option<bool>,
+    /// Staff bypass (Django: staff see unpublished/unlisted products).
+    /// When true and `is_published` is unset, the publication filter is
+    /// skipped entirely. Default false — anonymous/storefront behavior.
+    pub include_unpublished: bool,
     /// `Some(true)` = ORDER BY name ASC, `Some(false)` = DESC.
     pub order_name_asc: Option<bool>,
 }
 
 /// MPTT subtree (self + descendants) for the given category ids.
-async fn category_subtree_ids(
-    db: &impl sea_orm::ConnectionTrait,
-    ids: &[i32],
-) -> Result<Vec<i32>> {
+async fn category_subtree_ids(db: &impl sea_orm::ConnectionTrait, ids: &[i32]) -> Result<Vec<i32>> {
     use crate::entities::product_category::{Column as CatCol, Entity as Cat};
     use sea_orm::Condition;
     let bounds: Vec<(i32, i32, i32)> = Cat::find()
@@ -421,18 +436,23 @@ async fn filtered_select(
     use product_product::Column as P;
     use sea_orm::{Condition, QueryOrder};
     // Publication: default = listed in channel (matches list_products).
-    let mut q = match f.is_published {
-        Some(false) => product_select().filter(
-            product_product::Column::Id.in_subquery(
-                sea_orm::sea_query::Query::select()
-                    .column(product_productchannellisting::Column::ProductId)
-                    .from(product_productchannellisting::Entity)
-                    .and_where(product_productchannellisting::Column::ChannelId.eq(ch_id))
-                    .and_where(product_productchannellisting::Column::IsPublished.eq(false))
-                    .to_owned(),
+    // Staff bypass skips the filter (Django staff visibility).
+    let mut q = if f.include_unpublished && f.is_published.is_none() {
+        product_select()
+    } else {
+        match f.is_published {
+            Some(false) => product_select().filter(
+                product_product::Column::Id.in_subquery(
+                    sea_orm::sea_query::Query::select()
+                        .column(product_productchannellisting::Column::ProductId)
+                        .from(product_productchannellisting::Entity)
+                        .and_where(product_productchannellisting::Column::ChannelId.eq(ch_id))
+                        .and_where(product_productchannellisting::Column::IsPublished.eq(false))
+                        .to_owned(),
+                ),
             ),
-        ),
-        _ => published_filter(product_select(), ch_id),
+            _ => published_filter(product_select(), ch_id),
+        }
     };
     if !f.ids.is_empty() {
         q = q.filter(P::Id.is_in(f.ids.clone()));
@@ -460,16 +480,18 @@ async fn filtered_select(
         q = q.filter(P::CategoryId.is_in(sub));
     }
     if !f.collection_ids.is_empty() {
-        q = q.filter(P::Id.in_subquery(
-            sea_orm::sea_query::Query::select()
-                .column(crate::entities::product_collectionproduct::Column::ProductId)
-                .from(crate::entities::product_collectionproduct::Entity)
-                .and_where(
-                    crate::entities::product_collectionproduct::Column::CollectionId
-                        .is_in(f.collection_ids.clone()),
-                )
-                .to_owned(),
-        ));
+        q = q.filter(
+            P::Id.in_subquery(
+                sea_orm::sea_query::Query::select()
+                    .column(crate::entities::product_collectionproduct::Column::ProductId)
+                    .from(crate::entities::product_collectionproduct::Entity)
+                    .and_where(
+                        crate::entities::product_collectionproduct::Column::CollectionId
+                            .is_in(f.collection_ids.clone()),
+                    )
+                    .to_owned(),
+            ),
+        );
     }
     if let Some(hc) = f.has_category {
         q = if hc {
