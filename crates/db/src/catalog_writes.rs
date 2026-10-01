@@ -195,6 +195,9 @@ pub async fn delete_product(db: &DatabaseConnection, id: i32) -> Result<()> {
         .collect();
     delete_variants_tx(&txn, &vids).await?;
     exec(&txn, "UPDATE product_product SET default_variant_id = NULL WHERE id = $1", vec![id.into()]).await?;
+    // Cached renditions first (FK has no DB-level cascade; same reason as
+    // in `delete_media`).
+    exec(&txn, "DELETE FROM thumbnail_thumbnail WHERE product_media_id IN (SELECT id FROM product_productmedia WHERE product_id = $1)", vec![id.into()]).await?;
     for (table, col) in [
         ("product_producttranslation", "product_id"),
         ("product_productchannellisting", "product_id"),
@@ -1141,12 +1144,15 @@ pub async fn set_default_variant(db: &DatabaseConnection, product_id: i32, varia
 
 /// Create media from a URL (Django `productMediaCreate`; multipart Upload
 /// lands via fileUpload — URL/external media is the dashboard's common path).
+/// `media_type`: explicit `"IMAGE"`/`"VIDEO"` (Django probes the URL for
+/// oembed vs image). Legacy default when `None`: image → IMAGE, else VIDEO.
 pub async fn create_media(
     db: &DatabaseConnection,
     product_id: i32,
     alt: &str,
     image_url: Option<String>,
     external_url: Option<String>,
+    media_type: Option<&str>,
 ) -> Result<i32> {
     use crate::entities::{product_product, product_productmedia};
     if product_product::Entity::find_by_id(product_id).one(db).await?.is_none() {
@@ -1166,11 +1172,17 @@ pub async fn create_media(
         .one(db)
         .await?
         .flatten();
+    let media_type = match media_type.map(|s| s.to_ascii_uppercase()) {
+        Some(t) if t == "VIDEO" => "VIDEO",
+        Some(t) if t == "IMAGE" => "IMAGE",
+        _ if image_url.is_some() => "IMAGE",
+        _ => "VIDEO",
+    };
     let row = product_productmedia::ActiveModel {
         sort_order: Set(Some(max.unwrap_or(-1) + 1)),
         image: Set(image_url),
         alt: Set(alt.to_string()),
-        r#type: Set(if external_url.is_some() { "video".to_string() } else { "image".to_string() }),
+        r#type: Set(media_type.to_string()),
         external_url: Set(external_url),
         product_id: Set(Some(product_id)),
         oembed_data: Set(json!({})),
@@ -1201,8 +1213,119 @@ pub async fn update_media(db: &DatabaseConnection, id: i32, alt: Option<String>)
 }
 
 /// Delete media + variant links (Django `productMediaDelete`).
+/// Stored `image` paths for purge-AFTER-delete (Django `storage.delete`
+/// parity): the GraphQL layer fetches these first, deletes the rows, then
+/// best-effort purges the objects. Kept in `db` (not GraphQL) so gRPC and
+/// GraphQL share the same path source.
+pub async fn media_image_paths(db: &DatabaseConnection, ids: &[i32]) -> Vec<String> {
+    use crate::entities::product_productmedia::{Column as MCol, Entity as MEnt};
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    MEnt::find()
+        .select_only()
+        .column(MCol::Image)
+        .filter(MCol::Id.is_in(ids.to_vec()))
+        .into_tuple::<Option<String>>()
+        .all(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+
+/// Stored `image` paths of ALL media rows attached to a product (purge after
+/// `delete_product`, which cascades the rows without touching storage).
+pub async fn product_media_image_paths(
+    db: &DatabaseConnection,
+    product_id: i32,
+) -> Vec<String> {
+    use crate::entities::product_productmedia::{Column as MCol, Entity as MEnt};
+    MEnt::find()
+        .select_only()
+        .column(MCol::Image)
+        .filter(MCol::ProductId.eq(product_id))
+        .into_tuple::<Option<String>>()
+        .all(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+/// Stored rendition `image` paths for purge-AFTER-delete (same contract as
+/// `media_image_paths`, for the cached `Thumbnail` rows).
+pub async fn media_thumbnail_paths(db: &DatabaseConnection, ids: &[i32]) -> Vec<String> {
+    use crate::entities::thumbnail_thumbnail::{Column as TCol, Entity as TEnt};
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    TEnt::find()
+        .select_only()
+        .column(TCol::Image)
+        .filter(TCol::ProductMediaId.is_in(ids.to_vec()))
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .unwrap_or_default()
+}
+
+/// Stored rendition paths of ALL media rows attached to a product.
+pub async fn product_media_thumbnail_paths(
+    db: &DatabaseConnection,
+    product_id: i32,
+) -> Vec<String> {
+    use crate::entities::product_productmedia::{Column as MCol, Entity as MEnt};
+    let ids: Vec<i32> = MEnt::find()
+        .select_only()
+        .column(MCol::Id)
+        .filter(MCol::ProductId.eq(product_id))
+        .into_tuple()
+        .all(db)
+        .await
+        .unwrap_or_default();
+    media_thumbnail_paths(db, &ids).await
+}
+/// Bulk publish/unpublish across ALL channel listings of a product
+/// (admin-vip `productBulkPublish`, which exists on NEITHER backend upstream
+/// — semantics mirror `ProductChannelListingUpdate`: publishing stamps
+/// `published_at=now` where null; unpublishing flips the flag only).
+/// Returns listings updated. Missing product → Err (caller skips or errors).
+pub async fn set_product_published_all_channels(
+    db: &DatabaseConnection,
+    product_id: i32,
+    published: bool,
+) -> Result<u64> {
+    use crate::entities::product_product::Entity as PEnt;
+    use sea_orm::EntityTrait;
+    if PEnt::find_by_id(product_id).one(db).await?.is_none() {
+        return Err(DbError::Catalog(
+            format!("product {product_id} not found").into(),
+        ));
+    }
+    let rows = if published {
+        exec(
+            db,
+            "UPDATE product_productchannellisting SET is_published = TRUE, published_at = COALESCE(published_at, now()) WHERE product_id = $1",
+            vec![product_id.into()],
+        )
+        .await?
+    } else {
+        exec(
+            db,
+            "UPDATE product_productchannellisting SET is_published = FALSE WHERE product_id = $1",
+            vec![product_id.into()],
+        )
+        .await?
+    };
+    Ok(rows)
+}
+
 pub async fn delete_media(db: &DatabaseConnection, id: i32) -> Result<i32> {
-    use crate::entities::{product_productmedia, product_variantmedia};
+    use crate::entities::{product_productmedia, product_variantmedia, thumbnail_thumbnail};
     let txn = db.begin().await?;
     let m = product_productmedia::Entity::find_by_id(id)
         .one(&txn)
@@ -1213,12 +1336,18 @@ pub async fn delete_media(db: &DatabaseConnection, id: i32) -> Result<i32> {
         .filter(product_variantmedia::Column::MediaId.eq(id))
         .exec(&txn)
         .await?;
+    // Cached renditions (Django collector parity — the FK has no DB-level
+    // cascade, so the rows must go before the media row; the objects are
+    // purged by the caller via `media_thumbnail_paths`).
+    thumbnail_thumbnail::Entity::delete_many()
+        .filter(thumbnail_thumbnail::Column::ProductMediaId.eq(id))
+        .exec(&txn)
+        .await?;
     let am: product_productmedia::ActiveModel = m.into();
     am.delete(&txn).await?;
     txn.commit().await?;
     Ok(pid)
 }
-
 /// Reorder media by id list (Django `productMediaReorder`).
 pub async fn reorder_media(db: &DatabaseConnection, ordered_ids: &[i32]) -> Result<i32> {
     use crate::entities::product_productmedia;

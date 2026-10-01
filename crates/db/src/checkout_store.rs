@@ -207,14 +207,32 @@ pub async fn validate_lines(
             over,
         ));
     }
+    // Stock coverage, scoped to the channel's warehouses (Django checks
+    // channel stock, not global: another shop's warehouse must never
+    // satisfy this shop's checkout).
     let stocks = warehouse_stock::Entity::find()
         .filter(warehouse_stock::Column::ProductVariantId.is_in(vids.clone()))
         .all(db)
         .await
         .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?;
+    let ch_warehouses: std::collections::HashSet<uuid::Uuid> = {
+        use crate::entities::warehouse_channelwarehouse;
+        warehouse_channelwarehouse::Entity::find()
+            .select_only()
+            .column(warehouse_channelwarehouse::Column::WarehouseId)
+            .filter(warehouse_channelwarehouse::Column::ChannelId.eq(channel_id))
+            .into_tuple()
+            .all(db)
+            .await
+            .map_err(|e| fail("NOT_FOUND", e.to_string(), vec![]))?
+            .into_iter()
+            .collect()
+    };
     let mut avail: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
     for s in stocks {
-        *avail.entry(s.product_variant_id).or_insert(0) += s.quantity - s.quantity_allocated;
+        if ch_warehouses.contains(&s.warehouse_id) {
+            *avail.entry(s.product_variant_id).or_insert(0) += s.quantity - s.quantity_allocated;
+        }
     }
     let short: Vec<i32> = items
         .iter()

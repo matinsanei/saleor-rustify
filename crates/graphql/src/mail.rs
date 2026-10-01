@@ -120,3 +120,100 @@ pub async fn send_password_reset(to: &str, redirect_url: &str, token: &str, emai
     )
     .await
 }
+
+// ---------------------------------------------------------------------------
+// Order lifecycle notifications (Django `saleor/order/notifications.py`).
+// Upstream renders HTML templates through the plugin manager; this engine
+// sends the same trigger points as plain-text transactional mail (same
+// recipients, subjects, and key facts). Delivery is best-effort:
+// `notify_order` logs SMTP failures and never fails the mutation (celery
+// parity — Django's tasks retry in background, ours logs for ops pickup).
+// ---------------------------------------------------------------------------
+
+/// Trigger points mirroring Django's `send_*` notification functions.
+#[derive(Debug, Clone)]
+pub enum OrderNotice {
+    Confirmation,
+    Confirmed,
+    FulfillmentCreated { tracking: String },
+    FulfillmentUpdated { tracking: String },
+    PaymentConfirmed,
+    Canceled,
+    Refunded,
+}
+
+/// Load order facts + send the notice. Never errors the caller: SMTP failure
+/// is logged and swallowed (returns Ok either way — check logs for delivery).
+pub async fn notify_order(
+    db: &sea_orm::DatabaseConnection,
+    order_id: uuid::Uuid,
+    notice: OrderNotice,
+) {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+    let row: Option<(
+        Option<i32>,
+        String,
+        Option<rust_decimal::Decimal>,
+        String,
+    )> = saleor_rustify_db::entities::order_order::Entity::find_by_id(order_id)
+        .select_only()
+        .column(saleor_rustify_db::entities::order_order::Column::Number)
+        .column(saleor_rustify_db::entities::order_order::Column::UserEmail)
+        .column(saleor_rustify_db::entities::order_order::Column::TotalGrossAmount)
+        .column(saleor_rustify_db::entities::order_order::Column::Currency)
+        .into_tuple()
+        .one(db)
+        .await
+        .unwrap_or(None);
+    let Some((number, email, total, currency)) = row else {
+        tracing::warn!(order = %order_id, "order notice: order vanished");
+        return;
+    };
+    if email.trim().is_empty() {
+        return; // guest order without email — nothing to send to.
+    }
+    let total = total.unwrap_or_default();
+    let number = number.map(|n| n.to_string()).unwrap_or_default();
+    let (subject, body) = match notice {
+        OrderNotice::Confirmation => (
+            format!("Order #{number} confirmed"),
+            format!(
+                "Thank you for your order!\n\nOrder number: #{number}\nTotal: {total} {currency}\n\nWe will email you again once it ships."
+            ),
+        ),
+        OrderNotice::Confirmed => (
+            format!("Order #{number} confirmed by the store"),
+            format!("Your order #{number} ({total} {currency}) has been confirmed and will be processed shortly."),
+        ),
+        OrderNotice::FulfillmentCreated { tracking } => {
+            let track = if tracking.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\nTracking number: {tracking}")
+            };
+            (
+                format!("Order #{number} is on its way"),
+                format!("Good news — your order #{number} has shipped!{track}"),
+            )
+        }
+        OrderNotice::FulfillmentUpdated { tracking } => (
+            format!("Order #{number} shipment updated"),
+            format!("The tracking information for your order #{number} was updated.\nTracking number: {tracking}"),
+        ),
+        OrderNotice::PaymentConfirmed => (
+            format!("Payment received for order #{number}"),
+            format!("We have received your payment of {total} {currency} for order #{number}. Thank you!"),
+        ),
+        OrderNotice::Canceled => (
+            format!("Order #{number} canceled"),
+            format!("Your order #{number} has been canceled. If you were charged, a refund will follow separately."),
+        ),
+        OrderNotice::Refunded => (
+            format!("Order #{number} refunded"),
+            format!("Your order #{number} ({total} {currency}) has been refunded."),
+        ),
+    };
+    if let Err(e) = send_mail(&email, &subject, &body).await {
+        tracing::warn!(order = %order_id, to = %email, error = ?e, "order notice: SMTP send failed");
+    }
+}

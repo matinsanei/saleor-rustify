@@ -193,6 +193,119 @@ fn beat_entries() -> Vec<BeatEntry> {
             }
         })
     }
+    fn refresh_promotion_rule_links(
+        db: &DatabaseConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match saleor_rustify_db::promo_recalc::refresh_rule_variant_links(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[recalculate-promotion-rules]: relinked {n} rules"),
+                Err(e) => tracing::warn!("beat[recalculate-promotion-rules] failed: {e}"),
+            }
+        })
+    }
+    fn recalculate_discounted_prices(
+        db: &DatabaseConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match saleor_rustify_db::promo_recalc::recalculate_dirty_listings(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[recalculate-discounted-price]: repriced {n} listings"),
+                Err(e) => tracing::warn!("beat[recalculate-discounted-price] failed: {e}"),
+            }
+        })
+    }
+    fn expire_orders(
+        db: &DatabaseConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match saleor_rustify_db::order_expiry::expire_unconfirmed_orders(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[expire-orders]: expired {n} orders"),
+                Err(e) => tracing::warn!("beat[expire-orders] failed: {e}"),
+            }
+        })
+    }
+    fn delete_expired_orders(
+        db: &DatabaseConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match saleor_rustify_db::order_expiry::delete_expired_orders(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[delete-expired-orders]: deleted {n} orders"),
+                Err(e) => tracing::warn!("beat[delete-expired-orders] failed: {e}"),
+            }
+        })
+    }
+    fn lifecycle_ticks(
+        db: &DatabaseConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match saleor_rustify_db::lifecycle::promotion_toggle_tick(db).await {
+                Ok((0, 0)) => {}
+                Ok((s, e)) => tracing::info!("beat[promotion-toggle]: started {s} ended {e}"),
+                Err(e) => tracing::warn!("beat[promotion-toggle] failed: {e}"),
+            }
+            match saleor_rustify_db::lifecycle::deactivate_expired_gift_cards(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[giftcard-deactivate]: deactivated {n}"),
+                Err(e) => tracing::warn!("beat[giftcard-deactivate] failed: {e}"),
+            }
+            match saleor_rustify_db::lifecycle::deactivate_past_preorders(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[preorder-deactivate]: cleared {n} variants"),
+                Err(e) => tracing::warn!("beat[preorder-deactivate] failed: {e}"),
+            }
+        })
+    }
+    fn release_funds_scan(
+        db: &DatabaseConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match saleor_rustify_db::funds_release::scan_releasable_funds(db).await {
+                Ok(hits) if hits.is_empty() => {}
+                Ok(hits) => {
+                    for h in &hits {
+                        tracing::warn!(
+                            transaction = h.transaction_id,
+                            checkout = ?h.checkout_id,
+                            authorized = %h.authorized,
+                            charged = %h.charged,
+                            currency = %h.currency,
+                            "beat[release-funds]: authorized funds on expired checkout need reconciler release (no auto-release: PSP owned by Custom API)"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("beat[release-funds] failed: {e}"),
+            }
+        })
+    }
+    fn hygiene_tick(
+        db: &DatabaseConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match saleor_rustify_db::hygiene::recompute_stock_allocated(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[stock-alloc]: corrected {n} stocks"),
+                Err(e) => tracing::warn!("beat[stock-alloc] failed: {e}"),
+            }
+            match saleor_rustify_db::hygiene::delete_empty_allocations(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[empty-alloc]: deleted {n}"),
+                Err(e) => tracing::warn!("beat[empty-alloc] failed: {e}"),
+            }
+            match saleor_rustify_db::hygiene::prune_event_payloads(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[event-payloads]: pruned {n}"),
+                Err(e) => tracing::warn!("beat[event-payloads] failed: {e}"),
+            }
+            match saleor_rustify_db::hygiene::remove_deleted_apps(db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("beat[remove-apps]: removed {n}"),
+                Err(e) => tracing::warn!("beat[remove-apps] failed: {e}"),
+            }
+        })
+    }
     fn refresh_product_embeddings(
         db: &DatabaseConnection,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
@@ -235,29 +348,29 @@ fn beat_entries() -> Vec<BeatEntry> {
     vec![
         BeatEntry { name: "delete-expired-reservations", saleor_task: "saleor.warehouse.tasks.delete_expired_reservations_task", interval_secs: 60, job: Real(sweep_expired_reservations) },
         // --- deferred: schedule present, logic lands with its domain port ---
-        BeatEntry { name: "delete-empty-allocations", saleor_task: "saleor.warehouse.tasks.delete_empty_allocations_task", interval_secs: 24 * 3600, job: Deferred },
-        BeatEntry { name: "deactivate-preorder-for-variants", saleor_task: "saleor.product.tasks.deactivate_preorder_for_variants_task", interval_secs: 3600, job: Deferred },
+        BeatEntry { name: "delete-empty-allocations", saleor_task: "saleor.warehouse.tasks.delete_empty_allocations_task", interval_secs: 24 * 3600, job: Real(hygiene_tick) },
+        BeatEntry { name: "deactivate-preorder-for-variants", saleor_task: "saleor.product.tasks.deactivate_preorder_for_variants_task", interval_secs: 3600, job: Real(lifecycle_ticks) },
         BeatEntry { name: "delete-expired-checkouts", saleor_task: "saleor.checkout.tasks.delete_expired_checkouts", interval_secs: 24 * 3600, job: Real(sweep_expired_checkouts) },
-        BeatEntry { name: "delete_expired_orders", saleor_task: "saleor.order.tasks.delete_expired_orders_task", interval_secs: 24 * 3600, job: Deferred },
-        BeatEntry { name: "delete-outdated-event-data", saleor_task: "saleor.core.tasks.delete_event_payloads_task", interval_secs: 24 * 3600, job: Deferred },
-        BeatEntry { name: "deactivate-expired-gift-cards", saleor_task: "saleor.giftcard.tasks.deactivate_expired_cards_task", interval_secs: 24 * 3600, job: Deferred },
-        BeatEntry { name: "update-stocks-quantity-allocated", saleor_task: "saleor.warehouse.tasks.update_stocks_quantity_allocated_task", interval_secs: 24 * 3600, job: Deferred },
+        BeatEntry { name: "delete_expired_orders", saleor_task: "saleor.order.tasks.delete_expired_orders_task", interval_secs: 24 * 3600, job: Real(delete_expired_orders) },
+        BeatEntry { name: "delete-outdated-event-data", saleor_task: "saleor.core.tasks.delete_event_payloads_task", interval_secs: 24 * 3600, job: Real(hygiene_tick) },
+        BeatEntry { name: "deactivate-expired-gift-cards", saleor_task: "saleor.giftcard.tasks.deactivate_expired_cards_task", interval_secs: 24 * 3600, job: Real(lifecycle_ticks) },
+        BeatEntry { name: "update-stocks-quantity-allocated", saleor_task: "saleor.warehouse.tasks.update_stocks_quantity_allocated_task", interval_secs: 24 * 3600, job: Real(hygiene_tick) },
         BeatEntry { name: "delete-old-export-files", saleor_task: "saleor.csv.tasks.delete_old_export_files", interval_secs: 24 * 3600, job: Real(delete_old_export_files) },
         // Saleor: DB-driven promotion-toggle schedule; we poll daily until ported.
-        BeatEntry { name: "handle-promotion-toggle", saleor_task: "saleor.discount.tasks.handle_promotion_toggle", interval_secs: 24 * 3600, job: Deferred },
+        BeatEntry { name: "handle-promotion-toggle", saleor_task: "saleor.discount.tasks.handle_promotion_toggle", interval_secs: 24 * 3600, job: Real(lifecycle_ticks) },
         // Saleor: every ~60s (search-index rebuild checks).
         BeatEntry { name: "update-products-search-vectors", saleor_task: "saleor.product.tasks.update_products_search_vector_task", interval_secs: 60, job: Deferred },
         BeatEntry { name: "update-gift-cards-search-vectors", saleor_task: "saleor.giftcard.tasks.update_gift_cards_search_vector_task", interval_secs: 60, job: Deferred },
         BeatEntry { name: "update-pages-search-vectors", saleor_task: "saleor.page.tasks.update_pages_search_vector_task", interval_secs: 60, job: Deferred },
         BeatEntry { name: "update-checkouts-search-vectors", saleor_task: "saleor.checkout.tasks.update_checkouts_search_vector_task", interval_secs: 60, job: Deferred },
         // Saleor: BEAT_EXPIRE_ORDERS_AFTER_TIMEDELTA, default 5 minutes.
-        BeatEntry { name: "expire-orders", saleor_task: "saleor.order.tasks.expire_orders_task", interval_secs: 5 * 60, job: Deferred },
-        BeatEntry { name: "remove-apps-marked-as-removed", saleor_task: "saleor.app.tasks.remove_apps_task", interval_secs: 24 * 3600, job: Deferred },
+        BeatEntry { name: "expire-orders", saleor_task: "saleor.order.tasks.expire_orders_task", interval_secs: 5 * 60, job: Real(expire_orders) },
+        BeatEntry { name: "remove-apps-marked-as-removed", saleor_task: "saleor.app.tasks.remove_apps_task", interval_secs: 24 * 3600, job: Real(hygiene_tick) },
         // Saleor: every 10 minutes.
-        BeatEntry { name: "release-funds-for-abandoned-checkouts", saleor_task: "saleor.payment.tasks.transaction_release_funds_for_checkout_task", interval_secs: 10 * 60, job: Deferred },
+        BeatEntry { name: "release-funds-for-abandoned-checkouts", saleor_task: "saleor.payment.tasks.transaction_release_funds_for_checkout_task", interval_secs: 10 * 60, job: Real(release_funds_scan) },
         // Saleor: BEAT_PRICE_RECALCULATION_SCHEDULE, default 30 seconds.
-        BeatEntry { name: "recalculate-promotion-rules", saleor_task: "saleor.product.tasks.update_variant_relations_for_active_promotion_rules_task", interval_secs: 30, job: Deferred },
-        BeatEntry { name: "recalculate-discounted-price-for-products", saleor_task: "saleor.product.tasks.recalculate_discounted_price_for_products_task", interval_secs: 30, job: Deferred },
+        BeatEntry { name: "recalculate-promotion-rules", saleor_task: "saleor.product.tasks.update_variant_relations_for_active_promotion_rules_task", interval_secs: 30, job: Real(refresh_promotion_rule_links) },
+        BeatEntry { name: "recalculate-discounted-price-for-products", saleor_task: "saleor.product.tasks.recalculate_discounted_price_for_products_task", interval_secs: 30, job: Real(recalculate_discounted_prices) },
         // Saleor: every ~60s (automatic checkout completion check).
         BeatEntry { name: "checkout-automatic-completion", saleor_task: "saleor.checkout.tasks.trigger_automatic_checkout_completion_task", interval_secs: 60, job: Real(checkout_automatic_completion) },
         // Ours: vector-tier refresh (skip-unchanged, cheap on re-runs).

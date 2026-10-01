@@ -124,10 +124,10 @@ pub fn encode_cursor(i: usize) -> String {
 }
 /// Public media URL. Browsers resolve relative URLs against the DASHBOARD
 /// origin (:80), not the API (:8000) — so the default is absolute.
-/// Override with SALEOR_MEDIA_URL for other deployments.
+/// Base comes from `crate::storage::public_base()`: S3 custom domain when
+/// object storage is on, else `SALEOR_MEDIA_URL`, else localhost.
 pub fn media_url(path: &str) -> String {
-    let base = std::env::var("SALEOR_MEDIA_URL")
-        .unwrap_or_else(|_| "http://localhost:8000/media".into());
+    let base = crate::storage::public_base();
     format!("{}/{path}", base.trim_end_matches('/'))
 }
 

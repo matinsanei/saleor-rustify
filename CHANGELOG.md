@@ -59,6 +59,11 @@
 - `orderSettings` query + mutation accept an optional `channel`;
   `warehouses` list accepts one; gRPC voucher/apply paths use the
   checkout's own channel; collection products thread the request channel.
+- Nested pricing resolves the request's own channel three ways, in order:
+  explicit `x-saleor-channel` header, the request variables' root
+  `channel`/`input.channel` (server-side inference, zero caller changes),
+  else the unambiguous single-listing channel, else no price — never
+  another shop's prices. Verified live (USD vs PLN per root channel).
 
 ### Fixed (verification round 2)
 - Coverage gate counts authorized + charged (Django accepts either).
@@ -69,8 +74,10 @@
   totals (`INVALID` code) — 8 write paths.
 - Line validation moved to the shared `db::validate_lines` choke point:
   gRPC writers get the same stock/publish/limit/channel checks as
-  GraphQL (no more zero-priced ghost lines from any path). New
-  `LinesInvalid` struct carries code + variants; GraphQL maps it richly.
+  GraphQL (no more zero-priced ghost lines from any path). Stock is
+  scoped to the channel's warehouses — another shop's stock never
+  satisfies a checkout. New `LinesInvalid` struct carries code +
+  variants; GraphQL maps it richly.
 - PixelStack caller notes (informational — applied engine-side only):
   `customerCreate` exposes `errors` with `UNIQUE` on duplicates and
   `confirmAccount` accepts an `email` binding; the reconciliation metadata

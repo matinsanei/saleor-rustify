@@ -132,6 +132,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8000".to_string())
         .parse()?;
     let gql_schema = saleor_rustify_graphql::build_schema(db.clone());
+    /// Infer the request's Saleor channel from its own variables
+    /// (Saleor ChannelContext equivalent for nested resolvers): looks at
+    /// top-level `channel` plus `input.channel` (create inputs). Returns it
+    /// only when exactly one distinct non-empty value is present — batched
+    /// multi-channel requests stay unscopable (None) rather than guessing.
+    fn infer_request_channel(req: &async_graphql::Request) -> Option<String> {
+        fn as_slug(v: Option<&async_graphql::Value>) -> Option<String> {
+            match v {
+                Some(async_graphql::Value::String(s)) => {
+                    let t = s.trim().to_string();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t)
+                    }
+                }
+                _ => None,
+            }
+        }
+        let mut found: Vec<String> = vec![];
+        if let Some(c) = as_slug(req.variables.get("channel")) {
+            found.push(c);
+        }
+        if let async_graphql::Value::Object(input) =
+            req.variables.get("input").cloned().unwrap_or(async_graphql::Value::Null)
+        {
+            if let Some(c) = input.get("channel").and_then(|v| as_slug(Some(v))) {
+                found.push(c);
+            }
+        }
+        found.sort();
+        found.dedup();
+        if found.len() == 1 {
+            found.into_iter().next()
+        } else {
+            None
+        }
+    }
     let gql_app = {
         use axum::{routing::get, Router, Extension, Json};
         use async_graphql::http::GraphiQLSource;
@@ -183,14 +221,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 req = req.data(saleor_rustify_graphql::context::Bearer(bearer));
             }
             // Multi-channel scoping for nested resolvers (pricing has no
-            // channel arg in the schema): gateways send the query's channel
-            // here; absent means default-channel, same as before.
+            // channel arg in the schema): explicit `x-saleor-channel` header
+            // wins; otherwise infer the root query's channel from its
+            // variables (Saleor's ChannelContext equivalent — the parent
+            // query always carries it). Zero caller changes required.
+            let mut scoped = false;
             if let Some(ch) = headers.get("x-saleor-channel")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
             {
                 req = req.data(saleor_rustify_graphql::context::RequestChannel(ch));
+                scoped = true;
+            }
+            if !scoped {
+                if let Some(ch) = infer_request_channel(&req) {
+                    req = req.data(saleor_rustify_graphql::context::RequestChannel(ch));
+                }
             }
             Json({
                 let resp = schema.execute(req).await;
@@ -206,8 +253,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         async fn graphiql() -> axum::response::Html<String> {
             axum::response::Html(GraphiQLSource::build().endpoint("/graphql").finish())
         }
+        // Liveness/readiness probe (compose `healthcheck` + `pixelstack
+        // doctor` poll `GET /health` on every service): 200 always, with the
+        // DB reachability baked into the body so orchestrators can tell a
+        // degraded-but-alive engine from a fully-ready one.
+        async fn health(
+            Extension(db): Extension<Option<sea_orm::DatabaseConnection>>,
+        ) -> axum::Json<serde_json::Value> {
+            let db_ok = match &db {
+                Some(pool) => {
+                    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+                    pool.query_one(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT 1".to_string(),
+                    ))
+                    .await
+                    .is_ok()
+                }
+                None => false,
+            };
+            axum::Json(serde_json::json!({
+                "status": if db_ok { "ok" } else { "degraded" },
+                "db": db_ok,
+                "service": "saleor-rustify",
+            }))
+        }
         Router::new()
             .route("/graphql", get(graphiql).post(handler))
+            .route("/health", get(health))
             // Product/collection media files (populatedb writes them under
             // saleor-core/media; Saleor serves /media/ itself in dev).
             // SALEOR_MEDIA_DIR overrides; SALEOR_MEDIA_URL must match it.
@@ -218,6 +291,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|_| "../saleor/saleor-core/media".into()),
                 ),
             )
+            // On-demand thumbnails (`saleor/thumbnail/urls.py` parity):
+            // /thumbnail/<gid>/<size>/[<format>/] + /image/<gid>/.
+            // DB-backed (cache rows); mounted only when postgres is up —
+            // same degraded posture as the GraphQL schema without a DB.
+            .merge(
+                db.clone().map(|pool| {
+                    // Both slash variants: Django's pattern ends with `/`
+                    // (and APPEND_SLASH redirects the bare form); axum
+                    // matches exactly, so register both.
+                    Router::new()
+                        .route(
+                            "/thumbnail/:instance_id/:size",
+                            get(saleor_rustify_graphql::thumbnail::thumbnail_route),
+                        )
+                        .route(
+                            "/thumbnail/:instance_id/:size/",
+                            get(saleor_rustify_graphql::thumbnail::thumbnail_route),
+                        )
+                        .route(
+                            "/thumbnail/:instance_id/:size/:format",
+                            get(saleor_rustify_graphql::thumbnail::thumbnail_format_route),
+                        )
+                        .route(
+                            "/thumbnail/:instance_id/:size/:format/",
+                            get(saleor_rustify_graphql::thumbnail::thumbnail_format_route),
+                        )
+                        .route(
+                            "/image/:instance_id",
+                            get(saleor_rustify_graphql::thumbnail::original_route),
+                        )
+                        .route(
+                            "/image/:instance_id/",
+                            get(saleor_rustify_graphql::thumbnail::original_route),
+                        )
+                        .layer(Extension(pool))
+                })
+                .unwrap_or_else(Router::new),
+            )
             .layer(
                 CorsLayer::new()
                     .allow_origin(AllowOrigin::mirror_request())
@@ -226,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .allow_headers(AllowHeaders::mirror_request()),
             )
             .layer(Extension(gql_schema))
+            .layer(Extension(db.clone()))
     };
     let gql_listener = tokio::net::TcpListener::bind(gql_addr).await?;
     tracing::info!("GraphQL BFF listening on http://{gql_addr}/graphql (playground GET /graphql)");

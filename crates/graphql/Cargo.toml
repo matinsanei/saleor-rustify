@@ -23,3 +23,6 @@ saleor-rustify-psp = { path = "../psp" }
 saleor-rustify-core = { path = "../core" }
 sea-orm = { workspace = true }
 reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+image = "0.25"

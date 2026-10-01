@@ -711,11 +711,11 @@ impl OrderQuery {
             .map_err(|e| Error::new(format!("{e:?}")))?;
         let mut edges = vec![];
         for (i, vid) in page.iter().enumerate() {
-            let (sku, name, _, _) =
+            let (sku, name, _, _, _) =
                 b.vbase
                     .get(vid)
                     .cloned()
-                    .unwrap_or((None, String::new(), true, None));
+                    .unwrap_or((None, String::new(), true, None, None));
             let _ = off + i;
             edges.push(gen::ProductVariantCountableEdge {
                 node: Some(crate::catalog::build_variant(
@@ -1102,6 +1102,7 @@ impl OrderMutation {
             .await
             .map_err(|e| Error::new(e.to_string()))?
             .ok_or_else(|| Error::new("order vanished"))?;
+        crate::mail::notify_order(db, oid, crate::mail::OrderNotice::Canceled).await;
         Ok(GqlOrderCancel {
             order: Some(to_gen_order(db, &h, ls).await),
             errors: vec![],
@@ -1161,6 +1162,14 @@ impl OrderMutation {
         saleor_rustify_db::fulfillment::create_fulfillment(db, oid, &items, &tracking)
             .await
             .map_err(|e| Error::new(e.to_string()))?;
+        crate::mail::notify_order(
+            db,
+            oid,
+            crate::mail::OrderNotice::FulfillmentCreated {
+                tracking: tracking.clone(),
+            },
+        )
+        .await;
         let order_view = match saleor_rustify_db::order_store::get_order_rows(db, oid)
             .await
             .map_err(|e| Error::new(e.to_string()))?
@@ -1396,6 +1405,7 @@ impl OrderMutation {
                 errors: vec![oerr(e.to_string())],
             });
         }
+        crate::mail::notify_order(db, oid, crate::mail::OrderNotice::Confirmed).await;
         Ok(gen::OrderConfirm {
             order: order_view(db, oid).await?,
             errors: vec![],
@@ -1454,6 +1464,7 @@ impl OrderMutation {
                 errors: vec![oerr(e.to_string())],
             });
         }
+        crate::mail::notify_order(db, oid, crate::mail::OrderNotice::Refunded).await;
         Ok(gen::OrderRefund {
             order: order_view(db, oid).await?,
             errors: vec![],
@@ -1964,10 +1975,20 @@ impl OrderMutation {
         let fid = saleor_rustify_db::catalog::parse_gid(&id.0).unwrap_or(-1);
         let tracking = input.tracking_number.clone().unwrap_or_default();
         match saleor_rustify_db::fulfillment::update_tracking(db, fid, &tracking).await {
-            Ok(v) => Ok(gen::FulfillmentUpdateTracking {
-                order: order_view(db, v.order_id).await?,
-                errors: vec![],
-            }),
+            Ok(v) => {
+                crate::mail::notify_order(
+                    db,
+                    v.order_id,
+                    crate::mail::OrderNotice::FulfillmentUpdated {
+                        tracking: tracking.clone(),
+                    },
+                )
+                .await;
+                Ok(gen::FulfillmentUpdateTracking {
+                    order: order_view(db, v.order_id).await?,
+                    errors: vec![],
+                })
+            }
             Err(e) => Ok(gen::FulfillmentUpdateTracking {
                 order: None,
                 errors: vec![oerr(e.to_string())],

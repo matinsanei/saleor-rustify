@@ -67,6 +67,9 @@ async fn insert_rule(
         reward_value: Set(r.reward_value),
         promotion_id: Set(promotion_id),
         reward_type: Set(r.reward_type.clone()),
+        // New rules must be link-scanned by the beat pass (Django's
+        // `post_save` marks them dirty the same way).
+        variants_dirty: Set(Some(true)),
         ..Default::default()
     }
     .insert(txn)
@@ -179,17 +182,31 @@ pub async fn update_promotion(
     }
     am.updated_at = Set(Utc::now().into());
     am.update(&txn).await?;
+    // Date/type edits change rule activity → re-scan links.
+    crate::promo_recalc::mark_promotion_rules_dirty(&txn, id).await?;
     txn.commit().await?;
     Ok(())
 }
 
 async fn delete_rule_in(txn: &impl ConnectionTrait, id: Uuid) -> Result<()> {
+    // Products leaving the rule keep stale promo prices unless dirtied now
+    // (their M2M rows disappear below).
+    crate::promo_recalc::mark_rule_products_dirty(txn, id).await?;
     discount_promotionrule_channels::Entity::delete_many()
         .filter(discount_promotionrule_channels::Column::PromotionruleId.eq(id))
         .exec(txn)
         .await?;
     discount_promotionrule_gifts::Entity::delete_many()
         .filter(discount_promotionrule_gifts::Column::PromotionruleId.eq(id))
+        .exec(txn)
+        .await?;
+    // Listing↔rule denormalization rows (no DB cascade; Django's collector
+    // removes these with the rule).
+    crate::entities::product_variantchannellistingpromotionrule::Entity::delete_many()
+        .filter(
+            crate::entities::product_variantchannellistingpromotionrule::Column::PromotionRuleId
+                .eq(id),
+        )
         .exec(txn)
         .await?;
     discount_promotionrule_variants::Entity::delete_many()
@@ -216,6 +233,8 @@ pub async fn delete_promotion(db: &sea_orm::DatabaseConnection, id: Uuid) -> Res
         .into_tuple()
         .all(&txn)
         .await?;
+    // Mark BEFORE the M2M rows vanish below (product set is M2M-sourced).
+    crate::promo_recalc::mark_promotion_products_dirty(&txn, id).await?;
     for r in rules {
         delete_rule_in(&txn, r).await?;
     }
@@ -306,6 +325,8 @@ pub async fn update_rule(
     if let Some(v) = upd.reward_type.clone() {
         am.reward_type = Set(v);
     }
+    // Any rule edit invalidates its variant links (Django `post_save`).
+    am.variants_dirty = Set(Some(true));
     am.update(&txn).await?;
     for ch in &upd.add_channels {
         let exists = discount_promotionrule_channels::Entity::find()

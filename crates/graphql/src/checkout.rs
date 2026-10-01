@@ -1598,6 +1598,9 @@ impl CheckoutMutation {
                 co.currency.clone(),
             ),
         };
+        // Order confirmation mail (Django `send_order_confirmation` on the
+        // completed-checkout path): best-effort, never fails completion.
+        crate::mail::notify_order(db, out.order_id, crate::mail::OrderNotice::Confirmation).await;
         Ok(GqlCheckoutCompletePayload {
             order: Some(GqlCheckoutCompleteOrder {
                 id: ID(crate::common::gid("Order", out.order_id)),

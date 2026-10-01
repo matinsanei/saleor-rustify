@@ -32,6 +32,8 @@ pub mod mail;
 pub mod order;
 pub mod payment;
 pub mod schema;
+pub mod storage;
+pub mod thumbnail;
 pub mod translations;
 pub mod uploads;
 

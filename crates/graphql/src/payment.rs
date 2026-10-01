@@ -1804,6 +1804,15 @@ impl PaymentMutation {
                 .await
                 {
                     failed = Some(e.to_string());
+                } else if let Some(oid) = order_id {
+                    // Payment confirmation mail (Django
+                    // `send_payment_confirmation` on charge success).
+                    crate::mail::notify_order(
+                        db,
+                        oid,
+                        crate::mail::OrderNotice::PaymentConfirmed,
+                    )
+                    .await;
                 }
             }
         }

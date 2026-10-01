@@ -28,6 +28,7 @@ use crate::{
     DbError, Result,
 };
 
+#[derive(Clone)]
 pub struct ActiveRule {
     pub rule_id: Uuid,
     pub reward_value_type: String,
@@ -96,13 +97,14 @@ pub async fn active_catalogue_rules(
     Ok(out)
 }
 
-struct VariantContext {
-    product_id: i32,
-    category_id: Option<i32>,
-    collection_ids: Vec<i32>,
+#[derive(Clone)]
+pub(crate) struct VariantContext {
+    pub(crate) product_id: i32,
+    pub(crate) category_id: Option<i32>,
+    pub(crate) collection_ids: Vec<i32>,
 }
 
-async fn variant_context(
+pub(crate) async fn variant_context(
     db: &impl sea_orm::ConnectionTrait,
     product_id: i32,
 ) -> Result<VariantContext> {
@@ -127,7 +129,7 @@ async fn variant_context(
     })
 }
 
-async fn rule_matches_variant(
+pub(crate) async fn rule_matches_variant(
     db: &impl sea_orm::ConnectionTrait,
     rule: &ActiveRule,
     variant_id: i32,

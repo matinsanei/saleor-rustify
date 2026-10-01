@@ -9,14 +9,13 @@
 //!   content-type — spoofable), extension must match the mime's allowlist
 //! - `file_upload/<stem>_<8hex><ext>` naming (spaces → `_`); avatars under
 //!   `user-avatars/`, product images under `products/` (Django `upload_to`)
-//! Files land in `SALEOR_MEDIA_DIR` — the same dir `/media/` serves, so the
-//! returned URLs resolve immediately in the dashboard.
+//! Bytes go through `crate::storage` — S3/MinIO PUT when
+//! `AWS_S3_ENDPOINT_URL` is set, else the `SALEOR_MEDIA_DIR` local disk.
 //!
 //! Honest bounds (documented, same as upstream gaps): no rendition pipeline
 //! (VersatileImageField sizes served as originals), no virus scan.
 //! Uploads are buffered in RAM capped at `RUSTIFY_MAX_UPLOAD_BYTES`
-//! (default 20MiB) — the OOM guard; cleanup paths never escape the media
-//! root (absolute/`..` DB paths refused).
+//! (default 20MiB) — the OOM guard.
 
 use async_graphql::*;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, Set};
@@ -220,69 +219,6 @@ pub fn check_file(filename: &str, bytes: &[u8], images_only: bool) -> Result<Str
     Ok(cands[0].to_string())
 }
 
-/// Media root: same dir `/media/` serves (server `SALEOR_MEDIA_DIR` default).
-pub fn media_dir() -> std::path::PathBuf {
-    std::env::var("SALEOR_MEDIA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("../saleor/saleor-core/media"))
-}
-
-/// Persist bytes under `<media>/<subdir>/<stem>_<8hex><ext>` (Django
-/// `file_upload/<name>_<hash><ext>` scheme; spaces → `_`), return the
-/// storage-relative path (what Django columns store).
-pub fn save_upload(subdir: &str, filename: &str, bytes: &[u8]) -> Result<String, String> {
-    let base = std::path::Path::new(filename)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("upload");
-    let (stem, ext) = match base.rfind('.') {
-        Some(i) if i > 0 => (&base[..i], base[i..].to_lowercase()),
-        _ => (base, String::new()),
-    };
-    let clean: String = stem
-        .replace(' ', "_")
-        .chars()
-        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
-        .collect();
-    let stem = if clean.trim().is_empty() {
-        "upload".to_string()
-    } else {
-        clean
-    };
-    let hash = format!("{:08x}", rand::random::<u32>());
-    let rel = format!("{subdir}/{stem}_{hash}{ext}");
-    let dir = media_dir().join(subdir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create media dir: {e}"))?;
-    std::fs::write(media_dir().join(&rel), bytes)
-        .map_err(|e| format!("cannot store uploaded file: {e}"))?;
-    Ok(rel)
-}
-
-/// Best-effort unlink (Django storage.delete never fails the mutation either).
-/// `rel` comes from the DB, so it is fenced into the media root: absolute
-/// paths and `..` are refused (lexical check — the target may already be
-/// gone, so no canonicalize).
-fn unlink_rel(rel: &str) {
-    let rel = rel.trim();
-    if rel.is_empty() {
-        return;
-    }
-    let p = std::path::Path::new(rel);
-    if p.is_absolute()
-        || p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        tracing::warn!(path = %rel, "upload cleanup: refusing path outside media dir");
-        return;
-    }
-    let target = media_dir().join(p);
-    if let Err(e) = std::fs::remove_file(&target) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(path = %rel, error = %e, "upload cleanup: cannot delete file");
-        }
-    }
-}
-
 /// Staff JWT or app token (Django `fileUpload` permissions:
 /// AUTHENTICATED_APP / AUTHENTICATED_STAFF_USER).
 async fn staff_or_app(ctx: &Context<'_>, db: &sea_orm::DatabaseConnection) -> Result<(), Error> {
@@ -343,7 +279,8 @@ fn uerr(message: String) -> Vec<gen::UploadError> {
 }
 
 /// Delete avatar file + thumbnail rows (Django also deletes `Thumbnail`
-/// objects for the user; rendition files are best-effort unlinked).
+/// objects for the user; rendition files go through
+/// `crate::storage::delete_upload` — S3 object or local file, best-effort).
 async fn clear_avatar(
     db: &sea_orm::DatabaseConnection,
     uid: i32,
@@ -351,7 +288,7 @@ async fn clear_avatar(
 ) -> Result<(), Error> {
     use saleor_rustify_db::entities::thumbnail_thumbnail::{Column as TCol, Entity as TEnt};
     if let Some(rel) = current.filter(|s| !s.trim().is_empty()) {
-        unlink_rel(&rel);
+        crate::storage::delete_upload(&rel).await;
     }
     let thumbs: Vec<String> = TEnt::find()
         .select_only()
@@ -367,7 +304,7 @@ async fn clear_avatar(
         .await
         .map_err(|e| Error::new(e.to_string()))?;
     for t in thumbs {
-        unlink_rel(&t);
+        crate::storage::delete_upload(&t).await;
     }
     Ok(())
 }
@@ -419,7 +356,9 @@ impl UploadsMutation {
                 })
             }
         };
-        let rel = save_upload("file_upload", &up.filename, &up.bytes).map_err(Error::new)?;
+        let rel = crate::storage::store_upload("file_upload", &up.filename, &up.bytes, &mime)
+            .await
+            .map_err(Error::new)?;
         Ok(gen::FileUpload {
             uploaded_file: Some(gen::File {
                 url: Some(crate::common::media_url(&rel)),
@@ -439,12 +378,15 @@ impl UploadsMutation {
         let db = g.db()?;
         let uid = staff_user(ctx, db).await?;
         let up = read_upload(ctx, &image).await.map_err(Error::new)?;
-        if let Err(e) = check_file(&up.filename, &up.bytes, true) {
-            return Ok(gen::UserAvatarUpdate {
-                user: None,
-                errors: aerr(e),
-            });
-        }
+        let mime = match check_file(&up.filename, &up.bytes, true) {
+            Ok(m) => m,
+            Err(e) => {
+                return Ok(gen::UserAvatarUpdate {
+                    user: None,
+                    errors: aerr(e),
+                })
+            }
+        };
         use saleor_rustify_db::entities::account_user::{Column as UCol, Entity as UEnt};
         let current: Option<String> = UEnt::find_by_id(uid)
             .select_only()
@@ -455,7 +397,10 @@ impl UploadsMutation {
             .map_err(|e| Error::new(e.to_string()))?
             .flatten();
         clear_avatar(db, uid, current).await?;
-        let rel = save_upload("user-avatars", &up.filename, &up.bytes).map_err(Error::new)?;
+        let rel =
+            crate::storage::store_upload("user-avatars", &up.filename, &up.bytes, &mime)
+                .await
+                .map_err(Error::new)?;
         let mut am: saleor_rustify_db::entities::account_user::ActiveModel = UEnt::find_by_id(uid)
             .one(db)
             .await
@@ -501,28 +446,6 @@ impl UploadsMutation {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unlink_refuses_escape_but_deletes_inside() {
-        let dir = std::env::temp_dir().join("rustify-unlink-unit");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("SALEOR_MEDIA_DIR", &dir);
-        // Plain relative path under the root: deleted.
-        std::fs::write(dir.join("gone.txt"), b"x").unwrap();
-        unlink_rel("gone.txt");
-        assert!(!dir.join("gone.txt").exists());
-        // Absolute path outside the root: refused.
-        let outside = std::env::temp_dir().join("rustify-unlink-unit-outside.txt");
-        std::fs::write(&outside, b"x").unwrap();
-        unlink_rel(outside.to_str().unwrap());
-        assert!(outside.exists());
-        // `..` escape: refused (no file is even resolved).
-        unlink_rel("../rustify-unlink-unit-outside.txt");
-        assert!(outside.exists());
-        let _ = std::fs::remove_file(&outside);
-        std::env::remove_var("SALEOR_MEDIA_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn upload_cap_is_positive() {

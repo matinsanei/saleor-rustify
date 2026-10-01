@@ -1146,7 +1146,16 @@ impl CatalogQuery {
 /// carry media, channel listings, stocks, collections and attributes — all
 /// of it is exposed here in batched queries, never N+1.
 pub(crate) struct VariantBatches {
-    pub(crate) vbase: std::collections::HashMap<i32, (Option<String>, String, bool, Option<i32>)>,
+    pub(crate) vbase: std::collections::HashMap<
+        i32,
+        (
+            Option<String>,
+            String,
+            bool,
+            Option<i32>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >,
     vlist: std::collections::HashMap<
         i32,
         Vec<(
@@ -1201,14 +1210,15 @@ pub(crate) async fn load_variant_batches(
         ))
         .await
     };
-    for r in q(format!("SELECT id, sku, name, track_inventory, quantity_limit_per_customer FROM product_productvariant WHERE id IN ({in_list})"), params.clone())
+    for r in q(format!("SELECT id, sku, name, track_inventory, quantity_limit_per_customer, updated_at FROM product_productvariant WHERE id IN ({in_list})"), params.clone())
         .await.map_err(|e| Error::new(e.to_string()))? {
         if let Ok(vid) = r.try_get::<i32>("", "id") {
             b.vbase.insert(vid, (
                 r.try_get::<Option<String>>("", "sku").ok().flatten(),
                 r.try_get::<String>("", "name").unwrap_or_default(),
                 r.try_get::<bool>("", "track_inventory").unwrap_or(true),
-                r.try_get::<Option<i32>>("", "quantity_limit_per_customer").ok().flatten()));
+                r.try_get::<Option<i32>>("", "quantity_limit_per_customer").ok().flatten(),
+                r.try_get::<Option<chrono::DateTime<chrono::Utc>>>("", "updated_at").ok().flatten()));
         }
     }
     let mut chan_ids: HashSet<i32> = HashSet::new();
@@ -1370,11 +1380,11 @@ pub(crate) fn build_variant(
     fb_sku: String,
     fb_qty: i32,
 ) -> gen::ProductVariant {
-    let (sku, name, track, limit) =
+    let (sku, name, track, limit, updated) =
         m.vbase
             .get(&vid)
             .cloned()
-            .unwrap_or((Some(fb_sku), fb_name, true, None));
+            .unwrap_or((Some(fb_sku), fb_name, true, None, None));
     let listings: Vec<gen::ProductVariantChannelListing> = m
         .vlist
         .get(&vid)
@@ -1412,7 +1422,7 @@ pub(crate) fn build_variant(
         channel_listings: listings,
         media: m.variant_media.get(&vid).cloned().unwrap_or_default(),
         stocks,
-        updated_at: None,
+        updated_at: updated,
         product: None,
     }
 }
@@ -1903,11 +1913,11 @@ pub(crate) async fn assemble_variants(
     let mut out: Vec<(i32, gen::ProductVariant)> = variant_ids
         .iter()
         .map(|vid| {
-            let (sku, name, _, _) =
+            let (sku, name, _, _, _) =
                 vb.vbase
                     .get(vid)
                     .cloned()
-                    .unwrap_or((None, String::new(), true, None));
+                    .unwrap_or((None, String::new(), true, None, None));
             (
                 *vid,
                 build_variant(&vb, *vid, name, sku.unwrap_or_default(), 0),
@@ -1987,11 +1997,12 @@ fn taxed_here(
 }
 
 /// Request-scoped channel for nested resolvers (pricing has no channel
-/// argument in the schema). The gateway sends the query's channel via the
-/// `x-saleor-channel` header (Saleor's ChannelContext equivalent).
-/// Returns `None` when the caller didn't scope the request — resolvers
-/// then use the unambiguous single-listing channel or return no price,
-/// never another shop's prices.
+/// argument in the schema). The server sets it from the explicit
+/// `x-saleor-channel` header or, failing that, the request's own variables
+/// (root `channel` / `input.channel` — Saleor's ChannelContext equivalent).
+/// Returns `None` when the request carries no channel: resolvers then use
+/// the unambiguous single-listing channel or return no price, never
+/// another shop's prices.
 pub(crate) fn request_channel(ctx: &Context<'_>) -> Option<String> {
     ctx.data_opt::<crate::context::RequestChannel>()
         .map(|c| c.0.trim().to_string())
@@ -2951,6 +2962,73 @@ async fn attr_payload(
     assemble_attribute(db, aid).await.map_err(Error::new)
 }
 
+/// Host allowlist standing in for Django's oembed probe (`probe_media_url`):
+/// these hosts serve embed players, never raw images → VIDEO. Full oembed
+/// probing (fetching embed HTML per provider) is a documented gap.
+fn is_oembed_host(url: &str) -> bool {
+    const HOSTS: [&str; 7] = [
+        "youtube.com",
+        "youtu.be",
+        "vimeo.com",
+        "dailymotion.com",
+        "soundcloud.com",
+        "spotify.com",
+        "tiktok.com",
+    ];
+    let lower = url.trim().to_ascii_lowercase();
+    let host = lower
+        .split("://")
+        .nth(1)
+        .unwrap_or(&lower)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    HOSTS
+        .iter()
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+}
+
+#[derive(SimpleObject, Clone, Default)]
+#[graphql(name = "ProductBulkPublish")]
+pub struct ProductBulkPublishPayload {
+    pub count: Option<i32>,
+    pub errors: Vec<gen::ProductError>,
+}
+
+/// admin-vip `productBulkPublish(ids, isPublished)` — exists on NEITHER
+/// backend upstream (Django has no such op); survivors-commit, one error
+/// entry per missing product, `count` = listings flipped.
+async fn bulk_publish(
+    ctx: &Context<'_>,
+    db: &sea_orm::DatabaseConnection,
+    ids: &[ID],
+    is_published: bool,
+) -> Result<ProductBulkPublishPayload, async_graphql::Error> {
+    let mut count: i64 = 0;
+    let mut errors = vec![];
+    for id in ids {
+        match saleor_rustify_db::catalog::parse_gid(&id.0) {
+            Some(pid) => {
+                match saleor_rustify_db::catalog_writes::set_product_published_all_channels(
+                    db,
+                    pid,
+                    is_published,
+                )
+                .await
+                {
+                    Ok(n) => count += n as i64,
+                    Err(e) => errors.push(perr(None, e.to_string())),
+                }
+            }
+            None => errors.push(perr(Some("ids".into()), format!("bad product id: {}", id.0))),
+        }
+    }
+    Ok(ProductBulkPublishPayload {
+        count: Some(count as i32),
+        errors,
+    })
+}
+
 #[Object]
 impl CatalogWriteMutation {
     /// Dashboard `ProductTypeCreate` (Django parity: attributes linked).
@@ -3327,20 +3405,58 @@ impl CatalogWriteMutation {
             let stored = crate::uploads::read_upload(ctx, up)
                 .await
                 .map_err(Error::new)?;
-            if let Err(e) = crate::uploads::check_file(&stored.filename, &stored.bytes, true) {
-                return Ok(err(e));
-            }
+            let mime = match crate::uploads::check_file(&stored.filename, &stored.bytes, true) {
+                Ok(m) => m,
+                Err(e) => return Ok(err(e)),
+            };
             image_path = Some(
-                crate::uploads::save_upload("products", &stored.filename, &stored.bytes)
+                crate::storage::store_upload("products", &stored.filename, &stored.bytes, &mime)
+                    .await
                     .map_err(Error::new)?,
             );
         }
+        // Remote-URL upload (Django `fetch_product_media_image_task` parity,
+        // synchronous — see `storage::fetch_remote_image`): success fills
+        // `image` (external_url is still kept, like upstream); failure leaves
+        // the row external-only and the mutation still succeeds.
+        // Type parity with Django `probe_media_url`: known oembed hosts →
+        // VIDEO, anything else → IMAGE (pending until the fetch lands).
+        if image_path.is_none() {
+            if let Some(remote) = input.media_url.clone().filter(|u| !u.trim().is_empty()) {
+                match crate::storage::fetch_remote_image(&remote).await {
+                    Ok((bytes, hint, mime)) => {
+                        let name = crate::storage::remote_filename(&hint, &mime);
+                        match crate::storage::store_upload("products", &name, &bytes, &mime).await
+                        {
+                            Ok(rel) => {
+                                image_path = Some(rel);
+                            }
+                            Err(e) => tracing::warn!(
+                                url = %remote, error = %e,
+                                "productMediaCreate: fetched image could not be stored; keeping external URL"
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        url = %remote, error = %e,
+                        "productMediaCreate: remote fetch failed; keeping external URL"
+                    ),
+                }
+            }
+        }
+        let media_type = match (image_path.is_some(), &input.media_url) {
+            (true, _) => Some("IMAGE"),
+            (false, Some(u)) if is_oembed_host(u) => Some("VIDEO"),
+            (false, Some(_)) => Some("IMAGE"),
+            (false, None) => None,
+        };
         match saleor_rustify_db::catalog_writes::create_media(
             db,
             pid,
             &input.alt.clone().unwrap_or_default(),
             image_path,
             input.media_url.clone(),
+            media_type,
         )
         .await
         {
@@ -3386,11 +3502,21 @@ impl CatalogWriteMutation {
         let g = ctx.data::<GqlContext>()?;
         let db = g.db()?;
         let mid = saleor_rustify_db::catalog::parse_gid(&id.0).unwrap_or(-1);
+        // Fetch the stored path BEFORE the row delete so the object can be
+        // purged after commit (best-effort, Django `storage.delete` parity).
+        let paths = saleor_rustify_db::catalog_writes::media_image_paths(db, &[mid]).await;
+        let thumbs =
+            saleor_rustify_db::catalog_writes::media_thumbnail_paths(db, &[mid]).await;
         match saleor_rustify_db::catalog_writes::delete_media(db, mid).await {
-            Ok(_) => Ok(gen::ProductMediaDelete {
-                product: None,
-                errors: vec![],
-            }),
+            Ok(_) => {
+                for p in paths.into_iter().chain(thumbs) {
+                    crate::storage::delete_upload(&p).await;
+                }
+                Ok(gen::ProductMediaDelete {
+                    product: None,
+                    errors: vec![],
+                })
+            }
             Err(e) => Ok(gen::ProductMediaDelete {
                 product: None,
                 errors: vec![perr(None, e.to_string())],
@@ -3438,16 +3564,27 @@ impl CatalogWriteMutation {
             .iter()
             .filter_map(|m| saleor_rustify_db::catalog::parse_gid(&m.0))
             .collect();
-        match saleor_rustify_db::catalog_writes::bulk_delete_media(db, &mids).await {
-            Ok(n) => Ok(gen::ProductMediaBulkDelete {
-                count: Some(n),
-                errors: vec![],
-            }),
-            Err(e) => Ok(gen::ProductMediaBulkDelete {
-                count: Some(0),
-                errors: vec![perr(None, e.to_string())],
-            }),
+        // Per-id loop (not the db bulk helper): only purge objects whose row
+        // actually deleted — survivors-commit, same as Django.
+        let mut n = 0;
+        for mid in mids {
+            let paths = saleor_rustify_db::catalog_writes::media_image_paths(db, &[mid]).await;
+            let thumbs =
+                saleor_rustify_db::catalog_writes::media_thumbnail_paths(db, &[mid]).await;
+            if saleor_rustify_db::catalog_writes::delete_media(db, mid)
+                .await
+                .is_ok()
+            {
+                n += 1;
+                for p in paths.into_iter().chain(thumbs) {
+                    crate::storage::delete_upload(&p).await;
+                }
+            }
         }
+        Ok(gen::ProductMediaBulkDelete {
+            count: Some(n),
+            errors: vec![],
+        })
     }
 
     /// Dashboard `VariantMediaAssign`.
@@ -3498,6 +3635,20 @@ impl CatalogWriteMutation {
         }
     }
 
+    /// admin-vip `productBulkPublish` (no upstream equivalent on either
+    /// backend — see `bulk_publish` above for the shared logic).
+    async fn product_bulk_publish(
+        &self,
+        ctx: &Context<'_>,
+        ids: Vec<ID>,
+        #[graphql(name = "isPublished")] is_published: bool,
+    ) -> Result<ProductBulkPublishPayload> {
+        let _ = crate::account::require_perm(ctx, "manage_products").await?;
+        let g = ctx.data::<GqlContext>()?;
+        let db = g.db()?;
+        bulk_publish(ctx, db, &ids, is_published).await
+    }
+
     /// Dashboard `ProductBulkDelete` (survivors commit).
     async fn product_bulk_delete(
         &self,
@@ -3513,8 +3664,19 @@ impl CatalogWriteMutation {
             .collect();
         let mut errors = vec![];
         for pid in pids {
-            if let Err(e) = saleor_rustify_db::catalog_writes::delete_product(db, pid).await {
-                errors.push(perr(None, e.to_string()));
+            // `delete_product` cascades media rows — purge their objects only
+            // on successful row delete.
+            let paths =
+                saleor_rustify_db::catalog_writes::product_media_image_paths(db, pid).await;
+            let thumbs =
+                saleor_rustify_db::catalog_writes::product_media_thumbnail_paths(db, pid).await;
+            match saleor_rustify_db::catalog_writes::delete_product(db, pid).await {
+                Ok(()) => {
+                    for p in paths.into_iter().chain(thumbs) {
+                        crate::storage::delete_upload(&p).await;
+                    }
+                }
+                Err(e) => errors.push(perr(None, e.to_string())),
             }
         }
         Ok(gen::ProductBulkDelete { errors })
@@ -3761,8 +3923,17 @@ impl CatalogWriteMutation {
                 errors: vec![perr(Some("id".into()), "product not found".into())],
             });
         };
+        let paths =
+            saleor_rustify_db::catalog_writes::product_media_image_paths(db, pid).await;
+        let thumbs =
+            saleor_rustify_db::catalog_writes::product_media_thumbnail_paths(db, pid).await;
         match saleor_rustify_db::catalog_writes::delete_product(db, pid).await {
-            Ok(()) => Ok(gen::ProductDelete { errors: vec![] }),
+            Ok(()) => {
+                for p in paths.into_iter().chain(thumbs) {
+                    crate::storage::delete_upload(&p).await;
+                }
+                Ok(gen::ProductDelete { errors: vec![] })
+            }
             Err(e) => Ok(gen::ProductDelete {
                 errors: vec![perr(None, e.to_string())],
             }),
@@ -4840,11 +5011,11 @@ impl CatalogWriteMutation {
             }
             let pv = if errs.is_empty() {
                 let b = load_variant_batches(db, &[vid]).await?;
-                let (sku, name, _, _) =
+                let (sku, name, _, _, _) =
                     b.vbase
                         .get(&vid)
                         .cloned()
-                        .unwrap_or((None, String::new(), true, None));
+                        .unwrap_or((None, String::new(), true, None, None));
                 Some(build_variant(&b, vid, name, sku.unwrap_or_default(), 0))
             } else {
                 None
@@ -4942,11 +5113,11 @@ impl CatalogWriteMutation {
             let _ = idx;
             let pv = if errs.is_empty() {
                 let b = load_variant_batches(db, &[vid]).await?;
-                let (sku, name, _, _) =
+                let (sku, name, _, _, _) =
                     b.vbase
                         .get(&vid)
                         .cloned()
-                        .unwrap_or((None, String::new(), true, None));
+                        .unwrap_or((None, String::new(), true, None, None));
                 Some(build_variant(&b, vid, name, sku.unwrap_or_default(), 0))
             } else {
                 None
