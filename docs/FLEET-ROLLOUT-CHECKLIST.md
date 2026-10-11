@@ -175,8 +175,69 @@ all assume ONE Saleor. Target: shop registry → per-request engine.
       unknown shop → reject, never default-route)
 - [x] **3.6 Reconciler/payment/logistics run in shop context** (engine URL +
       pool + merchant resolved per order, never global)
+- [x] **3.7 Tenant config choke point** (`config/shop-settings.ts`, 2026-10-01):
+      118 env vars inventoried — infra (ports/pools/JWT/tuning) stays
+      `process.env`, everything seller-varying resolves per request as
+      `<BASE>_<SHOP>` → legacy `<BASE>` via the secret store (DB + env,
+      cluster-broadcast). Migrated: ZarinPal creds/sandbox, callback/return
+      URLs, app tokens, SMS (per-shop clients), email (per-shop SMTP +
+      brand), logistics (PostEx/Amadast/print), Google OAuth (per-shop),
+      Strapi/CMS + revalidate/preview secrets, media/front URLs, SEO brand,
+      order expiry, cache TTLs. `shop_id` stamped on carts/orders (migration
+      0021 + drizzle-kit snapshot). Admin: `PUT /environment/:key` accepts
+      `<BASE>_<SHOP>` + `GET /shops[/:id/settings]` (masked).
+      Evidence: API `tsc` clean, vitest 118 pass / 4 pre-existing fails
+      (baseline-identical: auth JWT, ZarinPal mocks, layout Redis-mock).
 
 ## Phase 4 — 5-shop rollout (one 8GB box) [x] COMPOSE+DONE 2026-10-01 — cutover itself is ops, per shop
+
+## Phase 5 — Catalog-mode shops (no Saleor) [x] DONE 2026-10-01
+For shops that only need a beautiful catalog (cafes etc.): no engine, no
+Saleor DB, no worker/beat — just rows + content.
+- Backend: `ShopMode full|catalog` + `locales` + `brand` in registry
+  (`SHOP_MODE/SHOP_LOCALES/SHOP_BRAND` secret overrides, no redeploy);
+  `catalog_items` table (migration 0022, drizzle-kit snapshot) with
+  public reads (`GET /api/catalog/items[/:slug|/categories]`, shop-scoped
+  via request context) + admin CRUD (`/api/admin/catalog?shop=`); public
+  `GET /api/shops/resolve?host=` (no secrets) + admin `GET /shops` now
+  returns the runtime profile.
+- Web: middleware resolves shop per host (60s cache, fail-open legacy);
+  stamps `x-shop-*` headers; catalog mode guards cart/checkout/payment/
+  order-success/dashboard (redirect home); single-locale shops get
+  prefix-less canonical URLs (internal rewrite, wrong-locale redirect);
+  `ShopProvider` + `useShop()`; cart fetch skipped, CartButton/account/
+  LanguageSwitcher hidden as appropriate; catalog list/detail from
+  `/api/catalog` (own cards + gallery detail, price only if set);
+  runtime brand (logo/name) + `--shop-primary` CSS var.
+- Strapi stays SINGLE (already shared — no new servers): per-shop pages via
+  `<shopId>--<slug>` convention with bare-slug fallback (no Strapi schema
+  change needed); layout Redis keys shop-scoped (`layout:<kind>:<shop>:<slug>`,
+  purge covers legacy + `*`); sellers never touch Strapi (admin-vip only).
+- White-label admin page (`/white-label`): shop picker, mode + languages,
+  brand editor, per-shop secrets (masked, `BASE_SHOP` keys) — all on the
+  existing secret-store endpoints, live on next request.
+- Speed (zero-loss design): no client-side shop fetching; middleware resolve
+  is 1 cached fetch/min/host; ISR-incompatible per-host pages stay edge-
+  cached (Varnish keyed by host, s-maxage preserved — incl. a fix applying
+  cache policy to the REWRITTEN path so single-locale shops keep caching).
+- Evidence: API `tsc` clean, web `tsc` clean, web `pnpm build` exit 0,
+  admin-vip `vite build` ok, API vitest unchanged (118 pass / 4 pre-existing
+  fails: auth JWT, ZarinPal mocks, layout Redis-mock).
+- admin-vip content entry: `/white-label` (mode/locales/brand/secrets) +
+  `/catalog` (items CRUD + incoming orders board, shop-scoped) pages,
+  `/media` tenant library, launcher cards, all on existing endpoints.
+- Cafe order flow (no Saleor, no account): `POST /api/catalog/checkout`
+  (server-side re-price from `catalog_items`, snapshot order row with
+  `metadata.source='catalog'`, ZarinPal direct via shared payment service +
+  existing callback/reconcile machinery); web localStorage cart, catalog
+  cart page branch, guest checkout form → gateway redirect; order-success
+  works (generic status poll); seller board in `/catalog` Orders tab.
+- Tenant media library (sellers never touch Strapi — Strapi admin is
+  single-tenant by design; iframe-embedding changes nothing): `media_assets`
+  table (migration 0023), per-shop MinIO buckets (auto-created + public
+  policy on first upload), `POST/GET/DELETE /api/media/assets` (shop from
+  request context, never params; auth-required), admin-vip `/media` page
+  (grid/upload/copy-URL/delete). Logo/brand images come from here.
 
 Proven numbers: Rust release idle ~8MB / load ~58MB / 1000-conn spike
 ~101MB (`BENCHMARK.md`); Python slice today ≈ 1.7GB limits. One engine
@@ -195,8 +256,7 @@ chosen model is one engine per shop for data independence.
 - [ ] **4.6 Shadow mode per shop** before cutover (compare Rust vs Django
       responses on copied traffic), then cut shops over one by one
 
-## Known non-blockers (documented, do not re-open without new evidence)
-- `Category.products` returns counts only (caller uses `totalCount` only)
+## Known non-blockers (documented, do not re-open without new evidence)- `Category.products` returns counts only (caller uses `totalCount` only)
 - `before`/`last` pagination ignored (forward-only)
 - `transactionReportEvent` caller text matches neither backend (dead code path)
 - Search is ILIKE+tsvector (recall-favoring, no Saleor rank)
@@ -208,3 +268,19 @@ chosen model is one engine per shop for data independence.
   for VIDEO typing); no `thumbnail_created` event emission
 - Dashboard harness is schema-validation (458/458); behavioral proof is
   the live E2E list in Phase 0, re-run after every engine change
+
+## Parked decisions (explicitly NOT decided 2026-10-01 — revisit with real sellers)
+- **User↔shop membership**: media/catalog uploads currently trust the request's
+  shop context (host-derived). Any logged-in user on a shop's domain writes to
+  that shop. Fine until real sellers arrive; then needs a membership model
+  (which users administer which shops) before opening signups.
+- **Strapi multi-tenancy**: rejected — Strapi admin is single-tenant by design;
+  sellers get purpose-built admin-vip tools (media library, catalog, brand)
+  instead. Strapi stays an internal composition tool.
+- **Strapi-on-Rust**: parked. Honest take — Strapi's value IS its admin UI +
+  plugin ecosystem; porting it means rebuilding both, which destroys the
+  reason to use it. If Strapi ever becomes the bottleneck, replace it with a
+  purpose-built lightweight CMS, don't port it.
+- **Custom domains (seller-owned)**: Phase 1 = wildcard subdomains only.
+  Phase 2 (Caddy on-demand TLS or equivalent) waits for the first paying
+  customer who demands their own domain.
