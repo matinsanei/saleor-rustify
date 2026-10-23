@@ -1,184 +1,160 @@
-# ⚡ saleor-rustify
+# saleor-rustify
 
-### Saleor, re-engineered in Rust. Same PostgreSQL. Zero migration. Just swap the image.
-
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-[![Rust 1.93](https://img.shields.io/badge/rust-1.93-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![gRPC + GraphQL](https://img.shields.io/badge/api-gRPC%20%2B%20GraphQL-blue.svg)](https://github.com/hyperium/tonic)
-[![Dashboard ops](https://img.shields.io/badge/dashboard_ops-458%2F458-brightgreen.svg)](#-proof-not-promises)
-[![Contract tests](https://img.shields.io/badge/contract_tests-171-brightgreen.svg)](#-proof-not-promises)
-[![Memory](https://img.shields.io/badge/RSS-~58MB-brightgreen.svg)](#-proof-not-promises)
-
-> **Trademark note:** saleor-rustify is an independent community project, not
-> affiliated with, endorsed by, or sponsored by Saleor Ltd. / Mirumee Software.
-> "Saleor" is used solely to describe API and database compatibility
-> (nominative fair use). If the Saleor team prefers a different name, we will
-> rename — see [For the Saleor team](#-for-the-saleor-team).
-
-[Saleor](https://github.com/saleor/saleor) is a great commerce engine in a slow
-body: CPython, GIL-bound requests, ORM-per-row overhead, gigabytes of RAM per
-node. **saleor-rustify** is a ground-up Rust rewrite that runs against **the
-exact same PostgreSQL schema Django created** — same 147 tables, same
-constraints, same rows, same sequences. Migration friction for operators:
-**zero**. Point the binary at your database URL and go. Django keeps working
-throughout — both read the same rows, and either side can serve at any point
-(strangler-fig, Expand–Contract).
+[English](#english) | [فارسی](#فارسی)
 
 ---
 
-## 🚀 Run it in 60 seconds
+## فارسی
+
+موتور تجارت الکترونیک Saleor را با Rust بازنویسی کرده‌ایم. همان PostgreSQL،
+همان اسکیمای Django، بدون هیچ جابه‌جایی داده. فقط ایمیج را عوض کنید.
+
+ما در پیکسل استک برای فروشگاه قائم پلاست به یک موتور تجارتی سریع، کم‌مصرف و
+پایدار نیاز داشتیم؛ چیزی که روی سرور کوچک هم نفس بکشد. نسخه اصلی سالور روی
+CPython است و زیر فشار، مصرف رم و تاخیر درخواست‌ها بارها خودش را نشان داد.
+به جای پچ کردن مشکل، تصمیم گرفتیم آن را از ریشه حل کنیم: بازنویسی کامل در
+Rust روی همان دیتابیس؛ تا کاربران دیگر هم بدون هزینه‌ای که ما کردیم از آن
+استفاده کنند.
+
+### چرا این پروژه خوب است
+
+- هیچ migration نمی‌خواهد؛ همان دیتابیس Django سالور را مستقیم می‌خواند و می‌نویسد
+- می‌توانید کنار Django اجرا کنید؛ هر دو روی همان ردیف‌ها کار می‌کنند (الگوی strangler-fig)
+- مصرف رم حدود 58 مگابایت؛ به جای چند گیگ برای هر نود در Python
+- داشبورد اصلی سالور با این موتور درست کار می‌کند؛ از مرور تا بازپرداخت
+- سرعت و تاخیر با عدد ثابت‌شده؛ روش اندازه‌گیری در [BENCHMARK.md](BENCHMARK.md)
+
+اگر از Saleor استفاده می‌کنید و از مصرف منابع آن خسته شده‌اید، این پروژه
+برای شما نوشته شده است.
+
+وب‌سایت رسمی سالور: [saleor.io](https://saleor.io) - منبع کد:
+[github.com/saleor/saleor](https://github.com/saleor/saleor)
+
+بقیه‌ی مستندات این فایل به انگلیسی است.
+
+---
+
+## English
+
+Saleor, re-engineered in Rust. Same PostgreSQL. Zero migration. Just swap the image.
+
+We run the [Ghaem Plastic](https://ghaemplast.com) storefront on [Saleor](https://github.com/saleor/saleor).
+Saleor is a solid commerce engine, but it runs on CPython: GIL-bound requests,
+row-by-row ORM overhead, and RAM bills that grow faster than traffic. This
+project is a ground-up Rust rewrite that talks to the exact same PostgreSQL
+schema Django created - same 147 tables, same constraints, same rows.
+You point the binary at your database URL and go.
+
+Both implementations can run side by side, reading and writing the same rows.
+Django keeps serving while Rust takes over route by route - the classic
+strangler-fig pattern, with no downtime window at any step.
+
+Official links: [saleor.io](https://saleor.io) from the original project website, and
+[github.com/saleor/saleor](https://github.com/saleor/saleor) on GitHub.
+
+Trademark note: saleor-rustify is an independent community project, not
+affiliated with or endorsed by Saleor Ltd. or Mirumee. The "Saleor" name is
+used only to describe API and database compatibility. We will rename if the
+Saleor team asks.
+
+### Run it in 60 seconds
 
 ```bash
-# 1. A Saleor database (yours, or spin one up + populate):
+# 1) A Saleor database (yours, or spin one up and populate it):
 cd saleor-core && cp .env.example .env && uv run poe migrate && uv run poe populatedb
 
-# 2. The Rust engine against it — no dump, no ETL, no downtime window:
+# 2) The Rust engine against the same database - no dumps, no ETL:
 export RUSTIFY_DATABASE_URL="postgres://saleor:saleor@localhost:5434/saleor"
 export RSA_PRIVATE_KEY="$(cat crates/db/tests/testdata/test_rsa.pem)"  # dev only
 ./target/debug/saleor-rustify
-# gRPC :50051 · GraphQL http://127.0.0.1:8000/graphql · metrics :9000
+# gRPC :50051 - GraphQL http://127.0.0.1:8000/graphql - metrics :9000
 
-# 3. The stock Saleor Dashboard, pointed at Rust:
+# 3) The stock Saleor Dashboard, pointed at Rust:
 API_URL=http://localhost:8000/graphql pnpm --filter dashboard dev
-# Every page renders. 458/458 dashboard operations validate. Zero schema errors.
 ```
 
-Or via Docker (images published per push to `master`):
+Docker works too. Images are published on every push to `master`:
 
 ```bash
 docker run --rm -p 50051:50051 -p 8000:8000 \
   -e RUSTIFY_DATABASE_URL="postgres://saleor:saleor@host.docker.internal:5434/saleor" \
   ghcr.io/matinsanei/saleor-rustify:latest
-# Modes: ...:latest worker|beat|check|migrate  (celery-worker / beat equivalents)
+# other modes: worker, beat, check, migrate
 ```
 
----
+### Measured results
 
-## 📊 Proof, not promises
+Numbers below are from September 2026, release binary against a local Postgres.
+Methodology and benchmark history live in [BENCHMARK.md](BENCHMARK.md).
 
-Measured September 2026, release binary, local Postgres — methodology and full
-history in [BENCHMARK.md](BENCHMARK.md):
+- binary size: about 60.5MB stripped
+- k6, 200 concurrent users: 3.28k requests/s, p50 around 41ms, p95 around 96ms, RSS about 58MB
+- head to head with CPython on catalog reads: roughly 20x throughput, 19x better latency
 
-```
-binary:          ~60.5MB stripped (LTO + codegen-units = 1)
-k6 (200 VU, 30s): 3.28k iters/s · gRPC p50 ~41ms · p95 ~96ms · 100% checks · RSS ~58MB
-head-to-head:     ≈20× throughput · ≈19× latency vs CPython on catalog reads
-```
-
-| Signal | Value | How verified |
+| Signal | Value | How we know |
 |---|---|---|
-| GraphQL surface | **91 queries / 346 mutations live** (schema: 90/339 — every root resolves) | introspection diff vs `schema-main.graphql` |
-| Dashboard compat | **458/458 operations validate** | `scripts/verify_dashboard_ops.py` |
-| Behavioral contracts | **171/171 green** | `cargo test -p saleor-rustify-db` (money/stock/status vs Django rows) |
-| Money math | `rust_decimal` everywhere, decimals cross the wire as strings | Django serializers parity |
+| GraphQL surface | 91 queries / 346 mutations live; every root resolves | introspection diff against `schema-main.graphql` |
+| Dashboard compat | 458 of 458 operations validate | `scripts/verify_dashboard_ops.py` |
+| Behavioral contracts | 171 of 171 pass | `cargo test -p saleor-rustify-db` |
+| Money math | `rust_decimal` everywhere, decimals cross the wire as strings | parity with Django serializers |
 
----
+### What works today
 
-## ✅ What works today
+The stock Saleor Dashboard runs end to end on this backend: browse, checkout,
+pay, fulfill, refund, plus the full back office. The complete item-by-item
+ledger is in [docs/SALEOR_PARITY_CHECKLIST.md](docs/SALEOR_PARITY_CHECKLIST.md).
+Short version:
 
-The stock dashboard runs end-to-end: browse → checkout → pay → fulfill →
-refund, plus the whole back-office. Full ledger:
-[docs/SALEOR_PARITY_CHECKLIST.md](docs/SALEOR_PARITY_CHECKLIST.md).
+- Checkout: new API plus legacy names, promos, delivery options, payment create
+- Money: transactions, Stripe intents, legacy payments, granted refunds - one ledger
+- Orders: confirm, capture, refund, void, mark-paid, fulfillments, returns, drafts, bulk import
+- Gift cards, vouchers, promotions, channel and tax configuration
+- Catalog: products, variants, categories, collections, attributes, media, translations
+- Accounts: staff, customers, groups, auth with throttling, real SMTP mail
+- Apps: webhooks with HMAC and retries, app installs, plugins, CSV exports
+- An AI crate on top: pg_trgm search, co-occurrence recommendations, grounded chat
 
-| Domain | Highlights |
-|---|---|
-| 🛒 Checkout | Full new API + legacy names, promos, delivery options, payment create, create-from-order |
-| 💸 Money | Transactions (authorize/charge/refund/cancel/initialize/process/create), Stripe intents, legacy payments, granted refunds — one ledger, never diverging |
-| 📦 Orders | Confirm/capture/refund/void/mark-paid, lines/discounts/notes, fulfillments + returns, drafts, 50-row bulk import |
-| 🎁 Gift cards | Full CRUD, custom codes, tags, notes, resend, settings, bulk, CSV export |
-| 🏷️ Marketing | Promotions + rules (engine-evaluated predicates), vouchers + codes, legacy sales (promotion-backed) |
-| 🗂️ Catalog | Products/variants/types/categories/collections, attributes, media, bulk create/import, translates |
-| 📄 Content | Menus (MPTT), pages + types + attributes |
-| 🚚 Logistics | Zones/methods/listings, warehouses, channels + settings, tax classes + country rates |
-| 👥 Accounts | Staff/customers/groups/addresses, auth + throttle + single-use tokens, validation rules, **real SMTP mail** |
-| 🔌 Apps | Webhooks CRUD + outbox worker, app install (real manifest fetch) + tokens, plugins, exports (CSV) |
-| 🧾 Ops extras | Invoices, refund/return-reason settings, order/invoice/discount events |
+Known gaps, each documented instead of hidden: multipart upload (`fileUpload`),
+the `checkouts` list query, Adyen and secondary gateways, tax providers,
+XLSX/filtered exports, replacement orders, TLS mail auth.
 
-**Honest gaps** (each documented where it bites, never silent): multipart
-upload (`fileUpload`, avatars), `checkouts` list query, Adyen + 29 gateways,
-tax providers, XLSX/filtered exports, replacement orders, TLS mail auth.
-
----
-
-## 🏗️ Architecture
+### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    saleor-rustify                       │
-│                                                          │
-│  crates/proto   Protobuf contracts (tonic build)         │
-│  crates/core    Pure domain logic — Money · PSP · discounts│
-│  crates/db      SeaORM over the REAL Django schema       │
-│    147 entities 1:1 · same tables · same sequences       │
-│  crates/graphql GraphQL BFF (thin + generated)           │
-│    catalog · checkout · order · payment · commerce · apps │
-│  crates/server  tonic gRPC (21 services) + Axum GraphQL   │
-│    gRPC :50051 · GraphQL :8000 · metrics :9000            │
-│    modes: api · worker · beat · check · migrate · seed    │
-└──────────────────────┬──────────────────────────────────┘
-                       │  RUSTIFY_DATABASE_URL
-                       ▼
-              PostgreSQL (Django-managed)
+crates/proto    protobuf contracts (tonic)
+crates/core     pure domain logic - money, PSP, discounts
+crates/db       SeaORM entities 1:1 over the real Django schema
+crates/graphql  thin generated GraphQL BFF
+crates/server   tonic gRPC (21 services) + Axum GraphQL
+                modes: api, worker, beat, check, migrate, seed
 ```
 
-**Design rules:** GraphQL is a translation layer over the same `db` functions
-gRPC uses — no duplicated money/stock math. `gen.rs` is generated from Saleor's
-own schema and never hand-edited. Every write is permission-gated
-(`manage_*`, superuser bypass, rotated-JWT revocation). Agents start at
-[AGENT.md](AGENT.md) — it documents every trap this project has found
-(stub-shadowing, dead impl blocks, money-bucket semantics).
+Two rules keep it sane. First, GraphQL is a thin translation layer over the
+same `db` functions gRPC uses, so money and stock math exists exactly once.
+Second, `gen.rs` is generated from Saleor's own published schema and is never
+hand-edited. Every write is permission-gated.
 
----
+Agent documentation lives in [AGENT.md](AGENT.md) - it lists every trap this
+project has already fallen into, so you don't have to repeat them.
 
-## 💌 For the Saleor team
+### Why you should care
 
-Yes — this is a hello. We rebuilt your engine in Rust because we believe in
-the data model and the API design enough to bet a rewrite on them. Concretely:
+If you operate Saleor today, the RAM line on your invoice and the CPython
+profile under load are probably familiar. We wrote this for our own store
+first and are now opening it up. If you end up running it in production,
+a GitHub star genuinely helps the project reach the next operator.
 
-- **What we want:** a conversation. Feedback on fidelity, blessing to keep the
-  compat name (or we'll rename on request), and stability expectations for the
-  plugin/webhook surface we build against.
-- **What we offer:** head-to-head performance data on your own schema,
-  a second implementation that pressure-tests API edge cases, and Rust-side
-  learnings (predicate evaluation, bucket recalculation) portable back to
-  CPython.
-- **What we won't do:** pretend affiliation, fork the trademark, or ship a
-  "compatible" badge over stubs — every gap is labeled in the checklist.
+### Contributing
 
-Saleor core is BSD-3-Clause; this project copies no Saleor code (clean
-reimplementation against the published GraphQL schema and SQL tables) and is
-licensed AGPL-3.0. Reach us via GitHub issues at
-[matinsanei/saleor-rustify](https://github.com/matinsanei/saleor-rustify).
+PRs welcome. House rules: no `float` for money, no `SELECT *` (tsvector and
+INTERVAL columns mistype with it), every domain PR ships contract tests, and
+every behavior cites the Saleor test it mirrors. Read [AGENT.md](AGENT.md)
+first.
 
----
+Issues: [github.com/matinsanei/saleor-rustify](https://github.com/matinsanei/saleor-rustify)
 
-## 🗺️ Roadmap
+### License
 
-- [x] Workspace + dual-stack skeleton (gRPC + GraphQL via Axum)
-- [x] Domain core with decimal math (Money/Product/Checkout/Order)
-- [x] SeaORM entities 1:1 from live Saleor PostgreSQL (sequence parity)
-- [x] Checkout writes + order persistence on Django tables
-- [x] Product relations (MPTT trees, listings, types, attributes, media)
-- [x] Commerce services (discount/shipping/giftcard/menu/page/account/channel/tax/warehouse)
-- [x] Payments (event-group recalc, PSP dedup/async/3DS, Stripe intents)
-- [x] Webhooks (fan-out, HMAC, attempts, backoff, sweeper) + worker/beat modes
-- [x] Auth (PBKDF2/bcrypt, RS256, throttling, single-use tokens, app tokens)
-- [x] Fulfillment lifecycle + granted refunds + draft orders + bulk import
-- [x] AI layer (`saleor-rustify-ai`): pg_trgm search, co-occurrence recommender, grounded chat
-- [x] Enterprise wave: apps, CSV exports, translates, invoices, SMTP, 90+ staff mutations
-- [ ] Multipart upload (`fileUpload`, avatars) + `checkouts` list
-- [ ] Second gateway (Adyen) + tax provider bridge
-- [ ] Storefront SDK v2 generated from protos
-
----
-
-## 🤝 Contributing
-
-PRs welcome. Rules: **no `float` for money · no `SELECT *`** (tsvector/INTERVAL
-mistype) **· every domain PR ships contract tests · every behavior cites the
-Saleor test it mirrors.** Read [AGENT.md](AGENT.md) first — it will save you
-from every trap we already found. Details: [docs/SALEOR_PARITY_CHECKLIST.md](docs/SALEOR_PARITY_CHECKLIST.md).
-
-## ⚖️ License
-
-AGPL-3.0 — free as in freedom, forever. See [LICENSE](LICENSE).
+AGPL-3.0. See [LICENSE](LICENSE). Saleor core is BSD-3-Clause; this project
+copies no Saleor code - it is a clean reimplementation against the published
+GraphQL schema and the SQL tables Django manages.
