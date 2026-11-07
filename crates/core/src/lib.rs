@@ -9,6 +9,7 @@ pub mod draft;
 pub mod giftcard;
 pub mod invoice;
 pub mod tax;
+pub mod marketplace;
 pub mod money;
 pub mod order;
 pub mod payments;
@@ -24,6 +25,8 @@ pub enum DomainError {
     Validation { field: String, message: String },
     #[error("out of stock: {0}")]
     OutOfStock(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
 }
 
 pub type Result<T> = std::result::Result<T, DomainError>;

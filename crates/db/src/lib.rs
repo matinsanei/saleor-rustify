@@ -45,6 +45,7 @@ pub mod promo_writes;
 pub mod reconcile;
 pub mod relations;
 pub mod webhooks;
+pub mod marketplace;
 
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 

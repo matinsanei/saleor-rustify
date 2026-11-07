@@ -4204,6 +4204,7 @@ dependencies = [
  "rust_decimal_macros",
  "saleor-rustify-core",
  "sea-orm",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

@@ -29,6 +29,7 @@ pub mod context;
 pub mod metadata;
 
 pub mod mail;
+pub mod marketplace;
 pub mod order;
 pub mod payment;
 pub mod schema;
@@ -37,4 +38,4 @@ pub mod thumbnail;
 pub mod translations;
 pub mod uploads;
 
-pub use schema::{build_schema, AppSchema};
+pub use schema::{build_schema, build_schema_with_bearer, AppSchema};

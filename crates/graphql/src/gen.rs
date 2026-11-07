@@ -2192,6 +2192,7 @@ pub enum FileTypesEnum {
 
 
 #[derive(Enum, Clone, Copy, PartialEq, Eq, Debug)]
+#[graphql(name = "LegacyFulfillmentStatus")]
 pub enum FulfillmentStatus {
 
     #[graphql(name = "FULFILLED")]
