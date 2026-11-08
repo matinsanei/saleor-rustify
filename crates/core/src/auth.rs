@@ -156,12 +156,47 @@ pub enum JwtError {
     Expired,
 }
 
+use std::sync::OnceLock;
+
+static EPHEMERAL_RSA_KEY: OnceLock<String> = OnceLock::new();
+
+/// Resolves RSA private key from env, file, or generates an ephemeral 2048-bit key in-memory on boot.
+pub fn resolve_rsa_private_key() -> String {
+    if let Ok(pem) = std::env::var("RSA_PRIVATE_KEY") {
+        let trimmed = pem.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    for path in &["/app/private_key.pem", "./private_key.pem", "../private_key.pem"] {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if content.contains("PRIVATE KEY") {
+                return content;
+            }
+        }
+    }
+    EPHEMERAL_RSA_KEY.get_or_init(|| {
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs8::EncodePrivateKey;
+        let mut rng = rand::rngs::OsRng;
+        match RsaPrivateKey::new(&mut rng, 2048) {
+            Ok(key) => key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            Err(e) => {
+                eprintln!("Failed to generate ephemeral RSA key: {e}");
+                String::new()
+            }
+        }
+    }).clone()
+}
+
 fn encoding_key_from(pem: &str) -> Result<jsonwebtoken::EncodingKey, JwtError> {
     jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| JwtError::BadKey(e.to_string()))
 }
 
 fn encoding_key() -> Result<jsonwebtoken::EncodingKey, JwtError> {
-    let pem = std::env::var("RSA_PRIVATE_KEY").map_err(|_| JwtError::NoKey)?;
+    let pem = resolve_rsa_private_key();
     encoding_key_from(&pem)
 }
 
@@ -238,7 +273,7 @@ fn mint_tokens_with_encoding_key(
 }
 
 pub fn decode(token: &str) -> Result<Claims, JwtError> {
-    let pem = std::env::var("RSA_PRIVATE_KEY").map_err(|_| JwtError::NoKey)?;
+    let pem = resolve_rsa_private_key();
     decode_with_key(token, &pem)
 }
 

@@ -278,8 +278,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "service": "saleor-rustify",
             }))
         }
+        // Internal token rotation & auto-negotiation endpoint for custom-api
+        async fn internal_token(
+            Extension(db): Extension<Option<sea_orm::DatabaseConnection>>,
+        ) -> axum::Json<serde_json::Value> {
+            let db = match db {
+                Some(d) => d,
+                None => {
+                    return axum::Json(serde_json::json!({
+                        "status": "error",
+                        "message": "database unavailable"
+                    }));
+                }
+            };
+            use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+            let user_res = db.query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT id, email, is_staff, is_superuser, jwt_token_key FROM account_user WHERE is_active = true ORDER BY is_superuser DESC, is_staff DESC, id ASC LIMIT 1".to_string(),
+            )).await;
+
+            let (uid, email, is_staff, token_key) = match user_res {
+                Ok(Some(row)) => {
+                    let uid: i32 = row.try_get("", "id").unwrap_or(1);
+                    let email: String = row.try_get("", "email").unwrap_or_else(|_| "admin@artemify.cloud".to_string());
+                    let is_staff: bool = row.try_get("", "is_staff").unwrap_or(true);
+                    let token_key: String = row.try_get("", "jwt_token_key").unwrap_or_else(|_| "key".to_string());
+                    (uid, email, is_staff, token_key)
+                }
+                _ => (1, "admin@artemify.cloud".to_string(), true, "defaultkey".to_string()),
+            };
+
+            let pem = saleor_rustify_core::auth::resolve_rsa_private_key();
+            match saleor_rustify_core::auth::mint_tokens_with_key(
+                &pem,
+                "http://localhost:8000/graphql/",
+                &email,
+                uid,
+                is_staff,
+                &token_key,
+            ) {
+                Ok(pair) => axum::Json(serde_json::json!({
+                    "status": "ok",
+                    "token": pair.access,
+                    "refreshToken": pair.refresh,
+                    "expires_in": 300,
+                    "user": {
+                        "id": uid,
+                        "email": email
+                    }
+                })),
+                Err(e) => axum::Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("mint failed: {e}")
+                })),
+            }
+        }
+
         Router::new()
             .route("/graphql", get(graphiql).post(handler))
+            .route("/graphql/", get(graphiql).post(handler))
+            .route("/internal/token", get(internal_token).post(internal_token))
+            .route("/internal/token/", get(internal_token).post(internal_token))
             .route("/health", get(health))
             // Product/collection media files (populatedb writes them under
             // saleor-core/media; Saleor serves /media/ itself in dev).

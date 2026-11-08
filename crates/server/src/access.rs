@@ -135,7 +135,6 @@ pub async fn authorize(
     metadata: &MetadataMap,
     codename: &str,
 ) -> Result<Requestor, Status> {
-    let pem = std::env::var("RSA_PRIVATE_KEY")
-        .map_err(|_| Status::unavailable("RSA_PRIVATE_KEY not configured"))?;
+    let pem = saleor_rustify_core::auth::resolve_rsa_private_key();
     authorize_with_key(db, metadata, codename, &pem).await
 }
