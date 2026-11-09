@@ -1,21 +1,24 @@
 # saleor-rustify — multi-stage. Runtime is busybox:glibc (~4MB) +
 # the ~20MB release binary: total well under the 100MB Phase-2 budget.
-# (gcr distroless would be equivalent; unreachable from this network.)
 ARG RUST_VERSION=1.93
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
 WORKDIR /build
-# Layer cache: deps first.
+RUN apt-get update -qq && apt-get install -y -qq protobuf-compiler > /dev/null
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN apt-get update -qq && apt-get install -y -qq protobuf-compiler > /dev/null \
-    && cargo build --release -p saleor-rustify-server --bin saleor-rustify \
-    && strip target/release/saleor-rustify
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release -p saleor-rustify-server --bin saleor-rustify \
+    && cp target/release/saleor-rustify /saleor-rustify \
+    && strip /saleor-rustify
 
 FROM busybox:glibc
-# Rust gnu binaries need libgcc_s; busybox:glibc ships libc but not that.
 COPY --from=builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/
-COPY --from=builder /build/target/release/saleor-rustify /saleor-rustify
+COPY --from=builder /saleor-rustify /saleor-rustify
 ENV RUSTIFY_ADDR=0.0.0.0:50051 \
     RUSTIFY_GRAPHQL_ADDR=0.0.0.0:8000 \
     RUSTIFY_METRICS_ADDR=0.0.0.0:9000 \
