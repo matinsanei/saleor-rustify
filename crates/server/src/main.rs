@@ -86,6 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = match saleor_rustify_db::connect(&saleor_rustify_db::database_url()).await {
         Ok(pool) => {
             tracing::info!("connected to Saleor PostgreSQL");
+            if let Err(e) = saleor_rustify_db::marketplace::apply_marketplace_migrations(&pool).await {
+                tracing::error!("failed to apply marketplace migrations: {e}");
+            } else {
+                tracing::info!("marketplace migrations applied successfully");
+            }
             Some(pool)
         }
         Err(e) => {
