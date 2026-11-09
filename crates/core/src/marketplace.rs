@@ -101,25 +101,46 @@ pub struct GridPagination {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum StorefrontBlock {
+    #[serde(alias = "HERO_SLIDER", alias = "HeroSlider")]
     HeroCarousel {
+        #[serde(default)]
         slides: Vec<HeroSlide>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "mediaUrl")]
+        media_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "ctaText")]
+        cta_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "targetSlug")]
+        target_slug: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         aspect_ratio: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auto_scroll_interval: Option<u32>,
     },
+    #[serde(alias = "HOT_DEALS", alias = "HotDeals")]
     HotDeals {
+        #[serde(default)]
         deal_products: Vec<DealProduct>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end_timestamp: Option<DateTime<Utc>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         discount_badge: Option<String>,
     },
+    #[serde(alias = "FEATURED_PRODUCTS", alias = "FeaturedProducts")]
     FeaturedProducts {
+        #[serde(default)]
         product_ids: Vec<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_style: Option<String>,
     },
+    #[serde(alias = "PRODUCT_GRID", alias = "ProductGrid")]
     ProductGrid {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         category_filter: Option<String>,
@@ -128,23 +149,69 @@ pub enum StorefrontBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pagination: Option<GridPagination>,
     },
+    #[serde(alias = "ANNOUNCEMENT_TICKER", alias = "AnnouncementTicker", alias = "MARQUEE")]
     Marquee {
+        #[serde(default)]
         items: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         speed: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direction: Option<String>,
     },
+    #[serde(alias = "CATEGORY_GRID", alias = "CategoryGrid", alias = "CATEGORY_CHIPS")]
     CategoryChips {
+        #[serde(default)]
         selected_categories: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
     },
+    #[serde(alias = "PROMO_BANNER", alias = "PromoBanner", alias = "PROMOTIONAL_BANNER")]
     PromotionalBanner {
+        #[serde(default, alias = "mediaUrl")]
         image_url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "targetSlug")]
         link_action: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "title")]
         text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "ctaText")]
+        cta_text: Option<String>,
     },
+    #[serde(alias = "VIDEO_REEL", alias = "VideoReel")]
+    VideoReel {
+        #[serde(default, alias = "videoUrl")]
+        video_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "mediaUrl")]
+        cover_image: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "targetSlug")]
+        action_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "ctaText")]
+        cta_text: Option<String>,
+    },
+    #[serde(alias = "BRAND_STORY", alias = "BrandStory")]
+    BrandStory {
+        #[serde(default)]
+        title: String,
+        #[serde(default, alias = "subtitle")]
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "mediaUrl")]
+        media_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "targetSlug")]
+        action_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "ctaText")]
+        cta_text: Option<String>,
+    },
+    #[serde(other)]
+    Custom,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -171,13 +238,14 @@ pub fn validate_layout_blocks(blocks: &[StorefrontBlock]) -> Result<()> {
         match block {
             StorefrontBlock::HeroCarousel {
                 slides,
+                media_url,
                 auto_scroll_interval,
                 ..
             } => {
-                if slides.is_empty() {
+                if slides.is_empty() && media_url.as_ref().map_or(true, |m| m.trim().is_empty()) {
                     return Err(DomainError::Validation {
                         field: format!("blocks[{index}].slides"),
-                        message: "HeroCarousel must have at least one slide".into(),
+                        message: "HeroCarousel must have at least one slide or a media_url".into(),
                     });
                 }
                 for (s_idx, slide) in slides.iter().enumerate() {
@@ -215,24 +283,19 @@ pub fn validate_layout_blocks(blocks: &[StorefrontBlock]) -> Result<()> {
                     }
                 }
             }
-            StorefrontBlock::FeaturedProducts { product_ids, .. } => {
-                if product_ids.is_empty() {
-                    return Err(DomainError::Validation {
-                        field: format!("blocks[{index}].product_ids"),
-                        message: "FeaturedProducts must contain at least one product ID".into(),
-                    });
-                }
+            StorefrontBlock::FeaturedProducts { .. } => {
+                // FeaturedProducts can be auto-resolved from catalog if product_ids empty
             }
             StorefrontBlock::ProductGrid { .. } => {
                 // ProductGrid is valid with default parameters
             }
             StorefrontBlock::Marquee {
-                items, direction, ..
+                items, title, direction, ..
             } => {
-                if items.is_empty() {
+                if items.is_empty() && title.as_ref().map_or(true, |t| t.trim().is_empty()) {
                     return Err(DomainError::Validation {
                         field: format!("blocks[{index}].items"),
-                        message: "Marquee must contain at least one text item".into(),
+                        message: "Marquee must contain at least one text item or a title".into(),
                     });
                 }
                 for (m_idx, item) in items.iter().enumerate() {
@@ -252,21 +315,25 @@ pub fn validate_layout_blocks(blocks: &[StorefrontBlock]) -> Result<()> {
                     }
                 }
             }
-            StorefrontBlock::CategoryChips { selected_categories } => {
-                if selected_categories.is_empty() {
+            StorefrontBlock::CategoryChips { .. } => {
+                // CategoryChips is valid
+            }
+            StorefrontBlock::PromotionalBanner { image_url, text, .. } => {
+                if image_url.trim().is_empty() && text.as_ref().map_or(true, |t| t.trim().is_empty()) {
                     return Err(DomainError::Validation {
-                        field: format!("blocks[{index}].selected_categories"),
-                        message: "CategoryChips must specify at least one category".into(),
+                        field: format!("blocks[{index}].image_url"),
+                        message: "PromotionalBanner requires image_url or title text".into(),
                     });
                 }
             }
-            StorefrontBlock::PromotionalBanner { image_url, .. } => {
-                if image_url.trim().is_empty() {
-                    return Err(DomainError::Validation {
-                        field: format!("blocks[{index}].image_url"),
-                        message: "PromotionalBanner image_url cannot be empty".into(),
-                    });
-                }
+            StorefrontBlock::VideoReel { .. } => {
+                // VideoReel is valid
+            }
+            StorefrontBlock::BrandStory { .. } => {
+                // BrandStory is valid
+            }
+            StorefrontBlock::Custom => {
+                // Extensible custom block is valid
             }
         }
     }
@@ -465,11 +532,17 @@ mod tests {
                     subtitle: None,
                     action_url: None,
                 }],
+                title: None,
+                subtitle: None,
+                media_url: None,
+                cta_text: None,
+                target_slug: None,
                 aspect_ratio: Some("16:9".into()),
                 auto_scroll_interval: Some(5000),
             },
             StorefrontBlock::Marquee {
                 items: vec!["FREE SHIPPING OVER $50".into()],
+                title: None,
                 speed: Some(30),
                 direction: Some("left".into()),
             },
@@ -477,6 +550,8 @@ mod tests {
                 image_url: "https://cdn.example.com/banner.png".into(),
                 link_action: Some("/sale".into()),
                 text: Some("50% OFF".into()),
+                subtitle: None,
+                cta_text: None,
             },
         ];
         assert!(validate_layout_blocks(&blocks).is_ok());
@@ -486,6 +561,11 @@ mod tests {
     fn test_validate_layout_blocks_empty_carousel_fails() {
         let blocks = vec![StorefrontBlock::HeroCarousel {
             slides: vec![],
+            title: None,
+            subtitle: None,
+            media_url: None,
+            cta_text: None,
+            target_slug: None,
             aspect_ratio: None,
             auto_scroll_interval: None,
         }];

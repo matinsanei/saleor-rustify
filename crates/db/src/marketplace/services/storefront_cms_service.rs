@@ -153,6 +153,34 @@ impl<'a> StorefrontCmsService<'a> {
         let blocks: Vec<StorefrontBlock> = serde_json::from_value(layout.blocks.clone())
             .unwrap_or_default();
 
+        // High-Scalability Engine (up to 300 blocks): Batch collect all product IDs
+        // across all blocks to fetch in a single database roundtrip, eliminating N+1 queries.
+        let mut batch_product_ids = std::collections::HashSet::new();
+        for block in &blocks {
+            match block {
+                StorefrontBlock::FeaturedProducts { product_ids, .. } => {
+                    batch_product_ids.extend(product_ids.iter().copied());
+                }
+                StorefrontBlock::HotDeals { deal_products, .. } => {
+                    for deal in deal_products {
+                        batch_product_ids.insert(deal.product_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let pids_vec: Vec<Uuid> = batch_product_ids.into_iter().collect();
+        let preloaded_products = self.fetch_products_with_details(&pids_vec).await?;
+        let mut products_map: std::collections::HashMap<Uuid, serde_json::Value> = std::collections::HashMap::new();
+        for p in preloaded_products {
+            if let Some(id_str) = p.get("id").and_then(|v| v.as_str()) {
+                if let Ok(u) = Uuid::parse_str(id_str) {
+                    products_map.insert(u, p);
+                }
+            }
+        }
+
         let mut enriched_values = Vec::new();
 
         for block in blocks {
@@ -160,8 +188,12 @@ impl<'a> StorefrontCmsService<'a> {
                 StorefrontBlock::FeaturedProducts {
                     product_ids,
                     display_style,
+                    ..
                 } => {
-                    let products = self.fetch_products_with_details(&product_ids).await?;
+                    let products: Vec<serde_json::Value> = product_ids
+                        .iter()
+                        .filter_map(|pid| products_map.get(pid).cloned())
+                        .collect();
                     enriched_values.push(serde_json::json!({
                         "type": "FeaturedProducts",
                         "display_style": display_style,
@@ -172,9 +204,12 @@ impl<'a> StorefrontCmsService<'a> {
                     deal_products,
                     end_timestamp,
                     discount_badge,
+                    ..
                 } => {
-                    let pids: Vec<Uuid> = deal_products.iter().map(|d| d.product_id).collect();
-                    let products = self.fetch_products_with_details(&pids).await?;
+                    let products: Vec<serde_json::Value> = deal_products
+                        .iter()
+                        .filter_map(|d| products_map.get(&d.product_id).cloned())
+                        .collect();
                     enriched_values.push(serde_json::json!({
                         "type": "HotDeals",
                         "end_timestamp": end_timestamp,

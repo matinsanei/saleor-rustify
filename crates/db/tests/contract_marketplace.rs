@@ -145,21 +145,31 @@ async fn test_marketplace_full_e2e_lifecycle() {
                 subtitle: Some("Limited batches".into()),
                 action_url: Some("/shop/ceramics".into()),
             }],
+            title: None,
+            subtitle: None,
+            media_url: None,
+            cta_text: None,
+            target_slug: None,
             aspect_ratio: Some("16:9".into()),
             auto_scroll_interval: Some(4000),
         },
         StorefrontBlock::Marquee {
             items: vec!["WORLDWIDE EXPRESS SHIPPING".into(), "HANDMADE IN JAPAN".into()],
+            title: None,
             speed: Some(40),
             direction: Some("left".into()),
         },
         StorefrontBlock::CategoryChips {
             selected_categories: vec!["Vases".into(), "Bowls".into(), "Teaware".into()],
+            title: None,
+            subtitle: None,
         },
         StorefrontBlock::PromotionalBanner {
             image_url: "https://cdn.example.com/promo.png".into(),
             link_action: Some("/discount".into()),
             text: Some("Use code SPRING10 for 10% off".into()),
+            subtitle: None,
+            cta_text: None,
         },
     ];
 
